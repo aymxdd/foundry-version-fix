@@ -17,7 +17,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tracing::{error, trace};
 
 /// The general purpose trait for handling RPC requests and subscriptions
 #[async_trait::async_trait]
@@ -40,8 +39,6 @@ pub struct PubSubContext<Handler: PubSubRpcHandler> {
     /// all active subscriptions `id -> Stream`
     subscriptions: Subscriptions<Handler::SubscriptionId, Handler::Subscription>,
 }
-
-// === impl PubSubContext ===
 
 impl<Handler: PubSubRpcHandler> PubSubContext<Handler> {
     /// Adds new active subscription
@@ -126,8 +123,6 @@ pub struct PubSubConnection<Handler: PubSubRpcHandler, Connection> {
     pending: VecDeque<String>,
 }
 
-// === impl PubSubConnection ===
-
 impl<Handler: PubSubRpcHandler, Connection> PubSubConnection<Handler, Connection> {
     pub fn new(connection: Connection, handler: Handler) -> Self {
         Self {
@@ -171,8 +166,8 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let pin = self.get_mut();
         loop {
-            // drive the sink
-            while let Poll::Ready(Ok(())) = pin.connection.poll_ready_unpin(cx) {
+            // drive the websocket
+            while matches!(pin.connection.poll_ready_unpin(cx), Poll::Ready(Ok(()))) {
                 // only start sending if socket is ready
                 if let Some(msg) = pin.pending.pop_front() {
                     if let Err(err) = pin.connection.start_send_unpin(msg) {
@@ -181,6 +176,14 @@ where
                 } else {
                     break
                 }
+            }
+
+            // Ensure any pending messages are flushed
+            // this needs to be called manually for tungsenite websocket: <https://github.com/foundry-rs/foundry/issues/6345>
+            if let Poll::Ready(Err(err)) = pin.connection.poll_flush_unpin(cx) {
+                trace!(target: "rpc", ?err, "websocket err");
+                // close the connection
+                return Poll::Ready(())
             }
 
             loop {

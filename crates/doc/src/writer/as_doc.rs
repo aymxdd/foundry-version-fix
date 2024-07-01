@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::{
     document::{read_context, DocumentContent},
     parser::ParseSource,
@@ -9,9 +7,10 @@ use crate::{
 };
 use forge_fmt::solang_ext::SafeUnwrap;
 use itertools::Itertools;
-use solang_parser::pt::Base;
+use solang_parser::pt::{Base, FunctionDefinition};
+use std::path::{Path, PathBuf};
 
-/// The result of [Asdoc::as_doc] method.
+/// The result of [`AsDoc::as_doc`].
 pub type AsDocResult = Result<String, std::fmt::Error>;
 
 /// A trait for formatting a parse unit as documentation.
@@ -128,32 +127,33 @@ impl AsDoc for Document {
                         if !contract.base.is_empty() {
                             writer.write_bold("Inherits:")?;
 
+                            // we need this to find the _relative_ paths
+                            let src_target_dir = self.target_src_dir();
+
                             let mut bases = vec![];
                             let linked =
                                 read_context!(self, CONTRACT_INHERITANCE_ID, ContractInheritance);
                             for base in contract.base.iter() {
                                 let base_doc = base.as_doc()?;
                                 let base_ident = &base.name.identifiers.last().unwrap().name;
-                                bases.push(
-                                    linked
-                                        .as_ref()
-                                        .and_then(|l| {
-                                            l.get(base_ident).map(|path| {
-                                                let path = Path::new("/").join(
-                                                    path.strip_prefix("docs/src")
-                                                        .ok()
-                                                        .unwrap_or(path),
-                                                );
-                                                Markdown::Link(
-                                                    &base_doc,
-                                                    &path.display().to_string(),
-                                                )
+
+                                let link = linked
+                                    .as_ref()
+                                    .and_then(|link| {
+                                        link.get(base_ident).map(|path| {
+                                            let path = Path::new("/").join(
+                                                path.strip_prefix(&src_target_dir)
+                                                    .ok()
+                                                    .unwrap_or(path),
+                                            );
+                                            Markdown::Link(&base_doc, &path.display().to_string())
                                                 .as_doc()
-                                            })
                                         })
-                                        .transpose()?
-                                        .unwrap_or(base_doc),
-                                )
+                                    })
+                                    .transpose()?
+                                    .unwrap_or(base_doc);
+
+                                bases.push(link);
                             }
 
                             writer.writeln_raw(bases.join(", "))?;
@@ -178,63 +178,18 @@ impl AsDoc for Document {
 
                         if let Some(funcs) = item.functions() {
                             writer.write_subtitle("Functions")?;
-                            funcs.into_iter().try_for_each(|(func, comments, code)| {
-                                let func_name = func
-                                    .name
-                                    .as_ref()
-                                    .map_or(func.ty.to_string(), |n| n.name.to_owned());
-                                let comments = comments.merge_inheritdoc(
-                                    &func_name,
-                                    read_context!(self, INHERITDOC_ID, Inheritdoc),
-                                );
 
-                                // Write function name
-                                writer.write_heading(&func_name)?;
-                                writer.writeln()?;
-
-                                // Write function docs
-                                writer.writeln_doc(
-                                    comments.exclude_tags(&[CommentTag::Param, CommentTag::Return]),
-                                )?;
-
-                                // Write function header
-                                writer.write_code(code)?;
-
-                                // Write function parameter comments in a table
-                                let params = func
-                                    .params
-                                    .iter()
-                                    .filter_map(|p| p.1.as_ref())
-                                    .collect::<Vec<_>>();
-                                writer.try_write_param_table(
-                                    CommentTag::Param,
-                                    &params,
-                                    &comments,
-                                )?;
-
-                                // Write function parameter comments in a table
-                                let returns = func
-                                    .returns
-                                    .iter()
-                                    .filter_map(|p| p.1.as_ref())
-                                    .collect::<Vec<_>>();
-                                writer.try_write_param_table(
-                                    CommentTag::Return,
-                                    &returns,
-                                    &comments,
-                                )?;
-
-                                writer.writeln()?;
-
-                                Ok::<(), std::fmt::Error>(())
-                            })?;
+                            for (func, comments, code) in funcs.iter() {
+                                self.write_function(&mut writer, func, comments, code)?;
+                            }
                         }
 
                         if let Some(events) = item.events() {
                             writer.write_subtitle("Events")?;
                             events.into_iter().try_for_each(|(item, comments, code)| {
                                 writer.write_heading(&item.name.safe_unwrap().name)?;
-                                writer.write_section(comments, code)
+                                writer.write_section(comments, code)?;
+                                writer.try_write_events_table(&item.fields, comments)
                             })?;
                         }
 
@@ -242,7 +197,8 @@ impl AsDoc for Document {
                             writer.write_subtitle("Errors")?;
                             errors.into_iter().try_for_each(|(item, comments, code)| {
                                 writer.write_heading(&item.name.safe_unwrap().name)?;
-                                writer.write_section(comments, code)
+                                writer.write_section(comments, code)?;
+                                writer.try_write_errors_table(&item.fields, comments)
                             })?;
                         }
 
@@ -250,7 +206,8 @@ impl AsDoc for Document {
                             writer.write_subtitle("Structs")?;
                             structs.into_iter().try_for_each(|(item, comments, code)| {
                                 writer.write_heading(&item.name.safe_unwrap().name)?;
-                                writer.write_section(comments, code)
+                                writer.write_section(comments, code)?;
+                                writer.try_write_properties_table(&item.fields, comments)
                             })?;
                         }
 
@@ -290,12 +247,19 @@ impl AsDoc for Document {
                         writer.writeln()?;
                     }
 
-                    ParseSource::Variable(_) |
-                    ParseSource::Event(_) |
-                    ParseSource::Error(_) |
-                    ParseSource::Struct(_) |
-                    ParseSource::Enum(_) |
-                    ParseSource::Type(_) => {
+                    ParseSource::Struct(ty) => {
+                        writer.write_section(&item.comments, &item.code)?;
+                        writer.try_write_properties_table(&ty.fields, &item.comments)?;
+                    }
+                    ParseSource::Event(ev) => {
+                        writer.write_section(&item.comments, &item.code)?;
+                        writer.try_write_events_table(&ev.fields, &item.comments)?;
+                    }
+                    ParseSource::Error(err) => {
+                        writer.write_section(&item.comments, &item.code)?;
+                        writer.try_write_errors_table(&err.fields, &item.comments)?;
+                    }
+                    ParseSource::Variable(_) | ParseSource::Enum(_) | ParseSource::Type(_) => {
                         writer.write_section(&item.comments, &item.code)?;
                     }
                 }
@@ -304,5 +268,47 @@ impl AsDoc for Document {
         };
 
         Ok(writer.finish())
+    }
+}
+
+impl Document {
+    /// Where all the source files are written to
+    fn target_src_dir(&self) -> PathBuf {
+        self.out_target_dir.join("src")
+    }
+
+    /// Writes a function to the buffer.
+    fn write_function(
+        &self,
+        writer: &mut BufWriter,
+        func: &FunctionDefinition,
+        comments: &Comments,
+        code: &str,
+    ) -> Result<(), std::fmt::Error> {
+        let func_name = func.name.as_ref().map_or(func.ty.to_string(), |n| n.name.to_owned());
+        let comments =
+            comments.merge_inheritdoc(&func_name, read_context!(self, INHERITDOC_ID, Inheritdoc));
+
+        // Write function name
+        writer.write_heading(&func_name)?;
+
+        writer.writeln()?;
+
+        // Write function docs
+        writer.writeln_doc(comments.exclude_tags(&[CommentTag::Param, CommentTag::Return]))?;
+
+        // Write function header
+        writer.write_code(code)?;
+
+        // Write function parameter comments in a table
+        let params = func.params.iter().filter_map(|p| p.1.as_ref()).collect::<Vec<_>>();
+        writer.try_write_param_table(CommentTag::Param, &params, &comments)?;
+
+        // Write function parameter comments in a table
+        let returns = func.returns.iter().filter_map(|p| p.1.as_ref()).collect::<Vec<_>>();
+        writer.try_write_param_table(CommentTag::Return, &returns, &comments)?;
+
+        writer.writeln()?;
+        Ok(())
     }
 }

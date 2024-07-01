@@ -1,6 +1,6 @@
 //! cli arguments for configuring the evm settings
+use alloy_primitives::{Address, B256, U256};
 use clap::{ArgAction, Parser};
-use ethers_core::types::{Address, H256, U256};
 use eyre::ContextCompat;
 use foundry_config::{
     figment::{
@@ -11,11 +11,11 @@ use foundry_config::{
     },
     Chain, Config,
 };
+use rustc_hash::FxHashMap;
 use serde::Serialize;
-use std::collections::HashMap;
 
 /// Map keyed by breakpoints char to their location (contract address, pc)
-pub type Breakpoints = HashMap<char, (Address, usize)>;
+pub type Breakpoints = FxHashMap<char, (Address, usize)>;
 
 /// `EvmArgs` and `EnvArgs` take the highest precedence in the Config/Figment hierarchy.
 /// All vars are opt-in, their default values are expected to be set by the
@@ -38,27 +38,34 @@ pub type Breakpoints = HashMap<char, (Address, usize)>;
 /// let opts = figment.extract::<EvmOpts>().unwrap();
 /// # }
 /// ```
-#[derive(Debug, Clone, Default, Parser, Serialize)]
-#[clap(next_help_heading = "EVM options", about = None, long_about = None)] // override doc
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "EVM options", about = None, long_about = None)] // override doc
 pub struct EvmArgs {
     /// Fetch state over a remote endpoint instead of starting from an empty state.
     ///
     /// If you want to fetch state from a specific block number, see --fork-block-number.
-    #[clap(long, short, visible_alias = "rpc-url", value_name = "URL")]
+    #[arg(long, short, visible_alias = "rpc-url", value_name = "URL")]
     #[serde(rename = "eth_rpc_url", skip_serializing_if = "Option::is_none")]
     pub fork_url: Option<String>,
 
     /// Fetch state from a specific block number over a remote endpoint.
     ///
     /// See --fork-url.
-    #[clap(long, requires = "fork_url", value_name = "BLOCK")]
+    #[arg(long, requires = "fork_url", value_name = "BLOCK")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_block_number: Option<u64>,
+
+    /// Number of retries.
+    ///
+    /// See --fork-url.
+    #[arg(long, requires = "fork_url", value_name = "RETRIES")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_retries: Option<u32>,
 
     /// Initial retry backoff on encountering errors.
     ///
     /// See --fork-url.
-    #[clap(long, requires = "fork_url", value_name = "BACKOFF")]
+    #[arg(long, requires = "fork_url", value_name = "BACKOFF")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_retry_backoff: Option<u64>,
 
@@ -69,24 +76,29 @@ pub struct EvmArgs {
     /// This flag overrides the project's configuration file.
     ///
     /// See --fork-url.
-    #[clap(long)]
+    #[arg(long)]
     #[serde(skip)]
     pub no_storage_caching: bool,
 
     /// The initial balance of deployed test contracts.
-    #[clap(long, value_name = "BALANCE")]
+    #[arg(long, value_name = "BALANCE")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_balance: Option<U256>,
 
     /// The address which will be executing tests.
-    #[clap(long, value_name = "ADDRESS")]
+    #[arg(long, value_name = "ADDRESS")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<Address>,
 
     /// Enable the FFI cheatcode.
-    #[clap(long)]
+    #[arg(long)]
     #[serde(skip)]
     pub ffi: bool,
+
+    /// Use the create 2 factory in all cases including tests and non-broadcasting scripts.
+    #[arg(long)]
+    #[serde(skip)]
+    pub always_use_create_2_factory: bool,
 
     /// Verbosity of the EVM.
     ///
@@ -97,7 +109,7 @@ pub struct EvmArgs {
     /// - 3: Print execution traces for failing tests
     /// - 4: Print execution traces for all tests, and setup traces for failing tests
     /// - 5: Print execution and setup traces for all tests
-    #[clap(long, short, verbatim_doc_comment, action = ArgAction::Count)]
+    #[arg(long, short, verbatim_doc_comment, action = ArgAction::Count)]
     #[serde(skip)]
     pub verbosity: u8,
 
@@ -105,22 +117,15 @@ pub struct EvmArgs {
     ///
     /// default value: 330
     ///
-    /// See also --fork-url and https://github.com/alchemyplatform/alchemy-docs/blob/master/documentation/compute-units.md#rate-limits-cups
-    #[clap(
-        long,
-        requires = "fork_url",
-        alias = "cups",
-        value_name = "CUPS",
-        help_heading = "Fork config"
-    )]
+    /// See also --fork-url and <https://docs.alchemy.com/reference/compute-units#what-are-cups-compute-units-per-second>
+    #[arg(long, alias = "cups", value_name = "CUPS", help_heading = "Fork config")]
     pub compute_units_per_second: Option<u64>,
 
     /// Disables rate limiting for this node's provider.
     ///
-    /// See also --fork-url and https://github.com/alchemyplatform/alchemy-docs/blob/master/documentation/compute-units.md#rate-limits-cups
-    #[clap(
+    /// See also --fork-url and <https://docs.alchemy.com/reference/compute-units#what-are-cups-compute-units-per-second>
+    #[arg(
         long,
-        requires = "fork_url",
         value_name = "NO_RATE_LIMITS",
         help_heading = "Fork config",
         visible_alias = "no-rate-limit"
@@ -129,9 +134,16 @@ pub struct EvmArgs {
     pub no_rpc_rate_limit: bool,
 
     /// All ethereum environment related arguments
-    #[clap(flatten)]
+    #[command(flatten)]
     #[serde(flatten)]
     pub env: EnvArgs,
+
+    /// Whether to enable isolation of calls.
+    /// In isolation mode all top-level calls are executed as a separate transaction in a separate
+    /// EVM context, enabling more precise gas accounting and transaction state changes.
+    #[arg(long)]
+    #[serde(skip)]
+    pub isolate: bool,
 }
 
 // Make this set of options a `figment::Provider` so that it can be merged into the `Config`
@@ -154,6 +166,17 @@ impl Provider for EvmArgs {
             dict.insert("ffi".to_string(), self.ffi.into());
         }
 
+        if self.isolate {
+            dict.insert("isolate".to_string(), self.isolate.into());
+        }
+
+        if self.always_use_create_2_factory {
+            dict.insert(
+                "always_use_create_2_factory".to_string(),
+                self.always_use_create_2_factory.into(),
+            );
+        }
+
         if self.no_storage_caching {
             dict.insert("no_storage_caching".to_string(), self.no_storage_caching.into());
         }
@@ -171,74 +194,81 @@ impl Provider for EvmArgs {
 }
 
 /// Configures the executor environment during tests.
-#[derive(Debug, Clone, Default, Parser, Serialize)]
-#[clap(next_help_heading = "Executor environment config")]
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "Executor environment config")]
 pub struct EnvArgs {
     /// The block gas limit.
-    #[clap(long, value_name = "GAS_LIMIT")]
+    #[arg(long, value_name = "GAS_LIMIT")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas_limit: Option<u64>,
 
     /// EIP-170: Contract code size limit in bytes. Useful to increase this because of tests. By
     /// default, it is 0x6000 (~25kb).
-    #[clap(long, value_name = "CODE_SIZE")]
+    #[arg(long, value_name = "CODE_SIZE")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_size_limit: Option<usize>,
 
-    /// The chain ID.
-    #[clap(long, alias = "chain", value_name = "CHAIN_ID")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chain_id: Option<Chain>,
+    /// The chain name or EIP-155 chain ID.
+    #[arg(long, visible_alias = "chain-id", value_name = "CHAIN")]
+    #[serde(rename = "chain_id", skip_serializing_if = "Option::is_none", serialize_with = "id")]
+    pub chain: Option<Chain>,
 
     /// The gas price.
-    #[clap(long, value_name = "GAS_PRICE")]
+    #[arg(long, value_name = "GAS_PRICE")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas_price: Option<u64>,
 
     /// The base fee in a block.
-    #[clap(long, visible_alias = "base-fee", value_name = "FEE")]
+    #[arg(long, visible_alias = "base-fee", value_name = "FEE")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_base_fee_per_gas: Option<u64>,
 
     /// The transaction origin.
-    #[clap(long, value_name = "ADDRESS")]
+    #[arg(long, value_name = "ADDRESS")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_origin: Option<Address>,
 
     /// The coinbase of the block.
-    #[clap(long, value_name = "ADDRESS")]
+    #[arg(long, value_name = "ADDRESS")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_coinbase: Option<Address>,
 
     /// The timestamp of the block.
-    #[clap(long, value_name = "TIMESTAMP")]
+    #[arg(long, value_name = "TIMESTAMP")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_timestamp: Option<u64>,
 
     /// The block number.
-    #[clap(long, value_name = "BLOCK")]
+    #[arg(long, value_name = "BLOCK")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_number: Option<u64>,
 
     /// The block difficulty.
-    #[clap(long, value_name = "DIFFICULTY")]
+    #[arg(long, value_name = "DIFFICULTY")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_difficulty: Option<u64>,
 
     /// The block prevrandao value. NOTE: Before merge this field was mix_hash.
-    #[clap(long, value_name = "PREVRANDAO")]
+    #[arg(long, value_name = "PREVRANDAO")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_prevrandao: Option<H256>,
+    pub block_prevrandao: Option<B256>,
 
     /// The block gas limit.
-    #[clap(long, value_name = "GAS_LIMIT")]
+    #[arg(long, value_name = "GAS_LIMIT")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_gas_limit: Option<u64>,
 
-    /// The memory limit of the EVM in bytes (32 MB by default)
-    #[clap(long, value_name = "MEMORY_LIMIT")]
+    /// The memory limit per EVM execution in bytes.
+    /// If this limit is exceeded, a `MemoryLimitOOG` result is thrown.
+    ///
+    /// The default is 128MiB.
+    #[arg(long, value_name = "MEMORY_LIMIT")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<u64>,
+
+    /// Whether to disable the block gas limit checks.
+    #[arg(long, visible_alias = "no-gas-limit")]
+    pub disable_block_gas_limit: bool,
 }
 
 impl EvmArgs {
@@ -248,33 +278,40 @@ impl EvmArgs {
     }
 }
 
+/// We have to serialize chain IDs and not names because when extracting an EVM `Env`, it expects
+/// `chain_id` to be `u64`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn id<S: serde::Serializer>(chain: &Option<Chain>, s: S) -> Result<S::Ok, S::Error> {
+    if let Some(chain) = chain {
+        s.serialize_u64(chain.id())
+    } else {
+        // skip_serializing_if = "Option::is_none" should prevent this branch from being taken
+        unreachable!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foundry_config::NamedChain;
 
     #[test]
     fn can_parse_chain_id() {
         let args = EvmArgs {
-            env: EnvArgs {
-                chain_id: Some(ethers_core::types::Chain::Mainnet.into()),
-                ..Default::default()
-            },
+            env: EnvArgs { chain: Some(NamedChain::Mainnet.into()), ..Default::default() },
             ..Default::default()
         };
         let config = Config::from_provider(Config::figment().merge(args));
-        assert_eq!(config.chain_id, Some(ethers_core::types::Chain::Mainnet.into()));
+        assert_eq!(config.chain, Some(NamedChain::Mainnet.into()));
 
         let env = EnvArgs::parse_from(["foundry-common", "--chain-id", "goerli"]);
-        assert_eq!(env.chain_id, Some(ethers_core::types::Chain::Goerli.into()));
+        assert_eq!(env.chain, Some(NamedChain::Goerli.into()));
     }
 
     #[test]
     fn test_memory_limit() {
         let args = EvmArgs {
-            env: EnvArgs {
-                chain_id: Some(ethers_core::types::Chain::Mainnet.into()),
-                ..Default::default()
-            },
+            env: EnvArgs { chain: Some(NamedChain::Mainnet.into()), ..Default::default() },
             ..Default::default()
         };
         let config = Config::from_provider(Config::figment().merge(args));
@@ -282,5 +319,17 @@ mod tests {
 
         let env = EnvArgs::parse_from(["foundry-common", "--memory-limit", "100"]);
         assert_eq!(env.memory_limit, Some(100));
+    }
+
+    #[test]
+    fn test_chain_id() {
+        let env = EnvArgs::parse_from(["foundry-common", "--chain-id", "1"]);
+        assert_eq!(env.chain, Some(Chain::mainnet()));
+
+        let env = EnvArgs::parse_from(["foundry-common", "--chain-id", "mainnet"]);
+        assert_eq!(env.chain, Some(Chain::mainnet()));
+        let args = EvmArgs { env, ..Default::default() };
+        let config = Config::from_provider(Config::figment().merge(args));
+        assert_eq!(config.chain, Some(Chain::mainnet()));
     }
 }

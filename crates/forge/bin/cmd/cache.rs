@@ -3,16 +3,15 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
     Arg, Command, Parser, Subcommand,
 };
-use ethers::prelude::Chain;
 use eyre::Result;
-use foundry_config::{cache, Chain as FoundryConfigChain, Config};
+use foundry_config::{cache, Chain, Config, NamedChain};
 use std::{ffi::OsStr, str::FromStr};
 use strum::VariantNames;
 
 /// CLI arguments for `forge cache`.
 #[derive(Debug, Parser)]
 pub struct CacheArgs {
-    #[clap(subcommand)]
+    #[command(subcommand)]
     pub sub: CacheSubcommands,
 }
 
@@ -27,12 +26,12 @@ pub enum CacheSubcommands {
 
 /// CLI arguments for `forge clean`.
 #[derive(Debug, Parser)]
-#[clap(group = clap::ArgGroup::new("etherscan-blocks").multiple(false))]
+#[command(group = clap::ArgGroup::new("etherscan-blocks").multiple(false))]
 pub struct CleanArgs {
     /// The chains to clean the cache for.
     ///
     /// Can also be "all" to clean all chains.
-    #[clap(
+    #[arg(
         env = "CHAIN",
         default_value = "all",
         value_parser = ChainOrAllValueParser::default(),
@@ -40,28 +39,29 @@ pub struct CleanArgs {
     chains: Vec<ChainOrAll>,
 
     /// The blocks to clean the cache for.
-    #[clap(
+    #[arg(
         short,
         long,
         num_args(1..),
-        use_value_delimiter(true),
         value_delimiter(','),
         group = "etherscan-blocks"
     )]
     blocks: Vec<u64>,
 
     /// Whether to clean the Etherscan cache.
-    #[clap(long, group = "etherscan-blocks")]
+    #[arg(long, group = "etherscan-blocks")]
     etherscan: bool,
 }
 
 impl CleanArgs {
     pub fn run(self) -> Result<()> {
-        let CleanArgs { chains, blocks, etherscan } = self;
+        let Self { chains, blocks, etherscan } = self;
 
         for chain_or_all in chains {
             match chain_or_all {
-                ChainOrAll::Chain(chain) => clean_chain_cache(chain, blocks.to_vec(), etherscan)?,
+                ChainOrAll::NamedChain(chain) => {
+                    clean_chain_cache(chain, blocks.to_vec(), etherscan)?
+                }
                 ChainOrAll::All => {
                     if etherscan {
                         Config::clean_foundry_etherscan_cache()?;
@@ -81,7 +81,7 @@ pub struct LsArgs {
     /// The chains to list the cache for.
     ///
     /// Can also be "all" to list all chains.
-    #[clap(
+    #[arg(
         env = "CHAIN",
         default_value = "all",
         value_parser = ChainOrAllValueParser::default(),
@@ -91,11 +91,11 @@ pub struct LsArgs {
 
 impl LsArgs {
     pub fn run(self) -> Result<()> {
-        let LsArgs { chains } = self;
+        let Self { chains } = self;
         let mut cache = Cache::default();
         for chain_or_all in chains {
             match chain_or_all {
-                ChainOrAll::Chain(chain) => {
+                ChainOrAll::NamedChain(chain) => {
                     cache.chains.push(Config::list_foundry_chain_cache(chain.into())?)
                 }
                 ChainOrAll::All => cache = Config::list_foundry_cache()?,
@@ -106,9 +106,9 @@ impl LsArgs {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub enum ChainOrAll {
-    Chain(Chain),
+    NamedChain(NamedChain),
     All,
 }
 
@@ -116,21 +116,17 @@ impl FromStr for ChainOrAll {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Ok(chain) = ethers::prelude::Chain::from_str(s) {
-            Ok(ChainOrAll::Chain(chain))
+        if let Ok(chain) = NamedChain::from_str(s) {
+            Ok(Self::NamedChain(chain))
         } else if s == "all" {
-            Ok(ChainOrAll::All)
+            Ok(Self::All)
         } else {
             Err(format!("Expected known chain or all, found: {s}"))
         }
     }
 }
 
-fn clean_chain_cache(
-    chain: impl Into<FoundryConfigChain>,
-    blocks: Vec<u64>,
-    etherscan: bool,
-) -> Result<()> {
+fn clean_chain_cache(chain: impl Into<Chain>, blocks: Vec<u64>, etherscan: bool) -> Result<()> {
     let chain = chain.into();
     if blocks.is_empty() {
         Config::clean_foundry_etherscan_chain_cache(chain)?;
@@ -154,7 +150,7 @@ pub struct ChainOrAllValueParser {
 
 impl Default for ChainOrAllValueParser {
     fn default() -> Self {
-        ChainOrAllValueParser { inner: possible_chains() }
+        Self { inner: possible_chains() }
     }
 }
 
@@ -177,7 +173,7 @@ impl TypedValueParser for ChainOrAllValueParser {
 }
 
 fn possible_chains() -> PossibleValuesParser {
-    Some(&"all").into_iter().chain(Chain::VARIANTS).into()
+    Some(&"all").into_iter().chain(NamedChain::VARIANTS).into()
 }
 
 #[cfg(test)]

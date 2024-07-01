@@ -1,14 +1,13 @@
-//! Format buffer
-
-use std::fmt::Write;
+//! Format buffer.
 
 use crate::{
     comments::{CommentState, CommentStringExt},
     string::{QuoteState, QuotedStringExt},
 };
+use std::fmt::Write;
 
 /// An indent group. The group may optionally skip the first line
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct IndentGroup {
     skip_line: bool,
 }
@@ -23,16 +22,16 @@ enum WriteState {
 impl WriteState {
     fn comment_state(&self) -> CommentState {
         match self {
-            WriteState::LineStart(state) => *state,
-            WriteState::WriteTokens(state) => *state,
-            WriteState::WriteString(_) => CommentState::None,
+            Self::LineStart(state) => *state,
+            Self::WriteTokens(state) => *state,
+            Self::WriteString(_) => CommentState::None,
         }
     }
 }
 
 impl Default for WriteState {
     fn default() -> Self {
-        WriteState::LineStart(CommentState::default())
+        Self::LineStart(CommentState::default())
     }
 }
 
@@ -415,17 +414,17 @@ mod tests {
     fn test_preserves_original_content_with_default_settings() -> std::fmt::Result {
         let contents = [
             "simple line",
-            r#"
+            r"
             some 
                     multiline
-    content"#,
+    content",
             "// comment",
             "/* comment */",
-            r#"mutliline
+            r"mutliline
             content
             // comment1
             with comments
-            /* comment2 */ "#,
+            /* comment2 */ ",
         ];
 
         for content in contents.iter() {

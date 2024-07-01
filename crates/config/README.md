@@ -1,11 +1,11 @@
 # Configuration
 
-Foundry's configuration system allows you to configure it's tools the way _you_ want while also providing with a
+Foundry's configuration system allows you to configure its tools the way _you_ want while also providing with a
 sensible set of defaults.
 
 ## Profiles
 
-Configurations can be arbitrarily namespaced by profiles. Foundry's default config is also named `default`, but can
+Configurations can be arbitrarily namespaced with profiles. Foundry's default config is also named `default`, but you can
 arbitrarily name and configure profiles as you like and set the `FOUNDRY_PROFILE` environment variable to the selected
 profile's name. This results in foundry's tools (forge) preferring the values in the profile with the named that's set
 in `FOUNDRY_PROFILE`. But all custom profiles inherit from the `default` profile.
@@ -56,7 +56,7 @@ The selected profile is the value of the `FOUNDRY_PROFILE` environment variable,
 
 ### All Options
 
-The following is a foundry.toml file with all configuration options set. See also [/config/src/lib.rs](/config/src/lib.rs) and [/cli/tests/it/config.rs](/cli/tests/it/config.rs).
+The following is a foundry.toml file with all configuration options set. See also [/config/src/lib.rs](./src/lib.rs) and [/cli/tests/it/config.rs](../forge/tests/it/config.rs).
 
 ```toml
 ## defaults for _all_ profiles
@@ -103,9 +103,10 @@ eth_rpc_url = "https://example.com/"
 # Setting this option enables decoding of error traces from mainnet deployed / verfied contracts via etherscan
 etherscan_api_key = "YOURETHERSCANAPIKEY"
 # ignore solc warnings for missing license and exceeded contract size
-# known error codes are: ["unreachable", "unused-return", "unused-param", "unused-var", "code-size", "shadowing", "func-mutability", "license", "pragma-solidity", "virtual-interfaces", "same-varname"]
+# known error codes are: ["unreachable", "unused-return", "unused-param", "unused-var", "code-size", "shadowing", "func-mutability", "license", "pragma-solidity", "virtual-interfaces", "same-varname", "too-many-warnings", "constructor-visibility", "init-code-size", "missing-receive-ether", "unnamed-return", "transient-storage"]
 # additional warnings can be added using their numeric error code: ["license", 1337]
 ignored_error_codes = ["license", "code-size"]
+ignored_warnings_from = ["path_to_ignore"]
 deny_warnings = false
 match_test = "Foo"
 no_match_test = "Bar"
@@ -114,6 +115,8 @@ no_match_contract = "Bar"
 match_path = "*/Foo*"
 no_match_path = "*/Bar*"
 ffi = false
+always_use_create_2_factory = false
+prompt_timeout = 120
 # These are the default callers, generated using `address(uint160(uint256(keccak256("foundry default caller"))))`
 sender = '0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38'
 tx_origin = '0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38'
@@ -121,9 +124,10 @@ initial_balance = '0xffffffffffffffffffffffff'
 block_number = 0
 fork_block_number = 0
 chain_id = 1
-# NOTE due to a toml-rs limitation, this value needs to be a string if the desired gas limit exceeds `i64::MAX` (9223372036854775807)
-# `gas_limit = "Max"` is equivalent to `gas_limit = "18446744073709551615"`
-gas_limit = 9223372036854775807
+# NOTE due to a toml-rs limitation, this value needs to be a string if the desired gas limit exceeds 2**63-1 (9223372036854775807).
+# `gas_limit = "max"` is equivalent to `gas_limit = "18446744073709551615"`. This is not recommended
+# as it will make infinite loops effectively hang during execution.
+gas_limit = 1073741824
 gas_price = 0
 block_base_fee_per_gas = 0
 block_coinbase = '0x0000000000000000000000000000000000000000'
@@ -131,12 +135,13 @@ block_timestamp = 0
 block_difficulty = 0
 block_prevrandao = '0x0000000000000000000000000000000000000000'
 block_gas_limit = 30000000
-memory_limit = 33554432
+memory_limit = 134217728
 extra_output = ["metadata"]
 extra_output_files = []
 names = false
 sizes = false
 via_ir = false
+ast = false
 # caches storage retrieved locally for certain chains and endpoints
 # can also be restricted to `chains = ["optimism", "mainnet"]`
 # by default all endpoints will be cached, alternative options are "remote" for only caching non localhost endpoints and "<regex>"
@@ -175,6 +180,11 @@ root = "root"
 # following example enables read-write access for the project dir :
 #       `fs_permissions = [{ access = "read-write", path = "./"}]`
 fs_permissions = [{ access = "read", path = "./out"}]
+# whether failed assertions should revert
+# note that this only applies to native (cheatcode) assertions, invoked on Vm contract
+assertions_revert = true
+# whether `failed()` should be invoked to check if the test have failed
+legacy_assertions = false
 [fuzz]
 runs = 256
 max_test_rejects = 65536
@@ -185,13 +195,13 @@ include_push_bytes = true
 
 [invariant]
 runs = 256
-depth = 15
+depth = 500
 fail_on_revert = false
 call_override = false
 dictionary_weight = 80
 include_storage = true
 include_push_bytes = true
-shrink_sequence = true
+shrink_run_limit = 5000
 
 [fmt]
 line_length = 100
@@ -249,7 +259,7 @@ The optional `url` attribute can be used to explicitly set the Etherscan API url
 [etherscan]
 mainnet = { key = "${ETHERSCAN_MAINNET_KEY}" }
 mainnet2 = { key = "ABCDEFG", chain = "mainnet" }
-optimism = { key = "1234576" }
+optimism = { key = "1234576", chain = 42 }
 unknownchain = { key = "ABCDEFG", url = "https://<etherscan-api-url-for-that-chain>" }
 ```
 
@@ -298,5 +308,5 @@ supported, this means that `FOUNDRY_SRC` and `DAPP_SRC` are equivalent.
 
 Some exceptions to the above are [explicitly ignored](https://github.com/foundry-rs/foundry/blob/10440422e63aae660104e079dfccd5b0ae5fd720/config/src/lib.rs#L1539-L15522) due to security concerns.
 
-Environment variables take precedence over values in `foundry.toml`. Values are parsed as loose form of TOML syntax.
+Environment variables take precedence over values in `foundry.toml`. Values are parsed as a loose form of TOML syntax.
 Consider the following examples:

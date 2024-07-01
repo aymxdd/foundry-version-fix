@@ -12,12 +12,10 @@ pub(crate) const NODE_USER_LOG_TARGET: &str = "node::user";
 ///
 /// This layer is intended to be used as filter for `NODE_USER_LOG_TARGET` events that will
 /// eventually be logged to stdout
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NodeLogLayer {
     state: LoggingManager,
 }
-
-// === impl NodeLogLayer ===
 
 impl NodeLogLayer {
     /// Returns a new instance of this layer
@@ -45,13 +43,11 @@ where
 }
 
 /// Contains the configuration of the logger
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct LoggingManager {
     /// Whether the logger is currently enabled
     pub enabled: Arc<RwLock<bool>>,
 }
-
-// === impl LoggingManager ===
 
 impl LoggingManager {
     /// Returns true if logging is currently enabled

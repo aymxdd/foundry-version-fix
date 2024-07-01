@@ -1,19 +1,18 @@
 use crate::{foundry_toml_dirs, remappings_from_env_var, remappings_from_newline, Config};
-use ethers_solc::remappings::{RelativeRemapping, Remapping};
 use figment::{
     value::{Dict, Map},
     Error, Metadata, Profile, Provider,
 };
+use foundry_compilers::artifacts::remappings::{RelativeRemapping, Remapping};
 use std::{
     borrow::Cow,
     collections::{btree_map::Entry, BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
-use tracing::trace;
 
 /// Wrapper types over a `Vec<Remapping>` that only appends unique remappings.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Remappings {
     /// Remappings.
     remappings: Vec<Remapping>,
@@ -30,15 +29,23 @@ impl Remappings {
         Self { remappings }
     }
 
+    /// Filters the remappings vector by name and context.
+    fn filter_key(r: &Remapping) -> String {
+        match &r.context {
+            Some(str) => str.clone() + &r.name.clone(),
+            None => r.name.clone(),
+        }
+    }
+
     /// Consumes the wrapper and returns the inner remappings vector.
     pub fn into_inner(self) -> Vec<Remapping> {
         let mut tmp = HashSet::new();
         let remappings =
-            self.remappings.iter().filter(|r| tmp.insert(r.name.clone())).cloned().collect();
+            self.remappings.iter().filter(|r| tmp.insert(Self::filter_key(r))).cloned().collect();
         remappings
     }
 
-    /// Push an element ot the remappings vector, but only if it's not already present.
+    /// Push an element to the remappings vector, but only if it's not already present.
     pub fn push(&mut self, remapping: Remapping) {
         if !self.remappings.iter().any(|existing| {
             // What we're doing here is filtering for ambiguous paths. For example, if we have
@@ -95,6 +102,7 @@ impl<'a> RemappingsProvider<'a> {
         trace!("get all remappings from {:?}", self.root);
         /// prioritizes remappings that are closer: shorter `path`
         ///   - ("a", "1/2") over ("a", "1/2/3")
+        ///
         /// grouped by remapping context
         fn insert_closest(
             mappings: &mut BTreeMap<Option<String>, BTreeMap<String, PathBuf>>,
@@ -143,7 +151,7 @@ impl<'a> RemappingsProvider<'a> {
         let mut all_remappings = Remappings::new_with_remappings(user_remappings);
 
         // scan all library dirs and autodetect remappings
-        // todo: if a lib specifies contexts for remappings manually, we need to figure out how to
+        // TODO: if a lib specifies contexts for remappings manually, we need to figure out how to
         // resolve that
         if self.auto_detect_remappings {
             let mut lib_remappings = BTreeMap::new();
@@ -156,10 +164,8 @@ impl<'a> RemappingsProvider<'a> {
                 .lib_paths
                 .iter()
                 .map(|lib| self.root.join(lib))
-                .inspect(|lib| {
-                    trace!("find all remappings in lib path: {:?}", lib);
-                })
-                .flat_map(Remapping::find_many)
+                .inspect(|lib| trace!(?lib, "find all remappings"))
+                .flat_map(|lib| Remapping::find_many(&lib))
             {
                 // this is an additional safety check for weird auto-detected remappings
                 if ["lib/", "src/", "contracts/"].contains(&r.name.as_str()) {

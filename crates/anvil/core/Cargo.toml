@@ -9,29 +9,36 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
-# foundry internal
-foundry-evm = { path = "../../evm" }
-revm = { version = "3", default-features = false, features = ["std", "serde", "memory_limit"] }
+foundry-common.workspace = true
+foundry-evm.workspace = true
+revm = { workspace = true, default-features = false, features = [
+    "std",
+    "serde",
+    "memory_limit",
+    "c-kzg",
+] }
 
-ethers-core.workspace = true
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = "1"
-bytes = { version = "1.4" }
-open-fastrlp = { version = "0.1.4", optional = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rpc-types = { workspace = true, features = ["anvil", "trace"] }
+alloy-serde.workspace = true
+alloy-rlp.workspace = true
+alloy-eips.workspace = true
+alloy-consensus = { workspace = true, features = ["k256", "kzg"] }
+alloy-dyn-abi = { workspace = true, features = ["std", "eip712"] }
+alloy-trie.workspace = true
 
-# trie
-hash-db = { version = "0.15", default-features = false }
-hash256-std-hasher = { version = "0.15", default-features = false }
-triehash = { version = "0.8", default-features = false }
-reference-trie = { version = "0.25" }
-keccak-hasher = { version = "0.15" }
+serde = { workspace = true, optional = true }
+serde_json.workspace = true
+bytes = "1.4"
 
-[dev-dependencies]
-serde = { version = "1.0", features = ["derive"] }
+# misc
+rand = "0.8"
 
 [features]
-default = []
+default = ["serde"]
 impersonated-tx = []
-fastrlp = ["dep:open-fastrlp"]
 serde = ["dep:serde"]

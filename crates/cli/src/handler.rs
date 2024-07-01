@@ -1,6 +1,5 @@
-use eyre::{EyreHandler, Result};
+use eyre::EyreHandler;
 use std::error::Error;
-use tracing::error;
 use yansi::Paint;
 
 /// A custom context type for Foundry specific error reporting via `eyre`
@@ -17,7 +16,7 @@ impl EyreHandler for Handler {
             return core::fmt::Debug::fmt(error, f)
         }
         writeln!(f)?;
-        write!(f, "{}", Paint::red(error))?;
+        write!(f, "{}", error.red())?;
 
         if let Some(cause) = error.source() {
             write!(f, "\n\nContext:")?;
@@ -48,12 +47,17 @@ impl EyreHandler for Handler {
 /// verbose debug-centric handler is installed.
 ///
 /// Panics are always caught by the more debug-centric handler.
-#[cfg_attr(windows, inline(never))]
-pub fn install() -> Result<()> {
-    let debug_enabled = std::env::var("FOUNDRY_DEBUG").is_ok();
+pub fn install() {
+    // If the user has not explicitly overridden "RUST_BACKTRACE", then produce full backtraces.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "full");
+    }
 
+    let debug_enabled = std::env::var("FOUNDRY_DEBUG").is_ok();
     if debug_enabled {
-        color_eyre::install()?;
+        if let Err(e) = color_eyre::install() {
+            debug!("failed to install color eyre error hook: {e}");
+        }
     } else {
         let (panic_hook, _) = color_eyre::config::HookBuilder::default()
             .panic_section(
@@ -61,15 +65,8 @@ pub fn install() -> Result<()> {
             )
             .into_hooks();
         panic_hook.install();
-        // see <https://github.com/foundry-rs/foundry/issues/3050>
-        if cfg!(windows) {
-            if let Err(err) = eyre::set_hook(Box::new(move |_| Box::new(Handler))) {
-                error!(?err, "failed to install panic hook");
-            }
-        } else {
-            eyre::set_hook(Box::new(move |_| Box::new(Handler)))?;
+        if let Err(e) = eyre::set_hook(Box::new(move |_| Box::new(Handler))) {
+            debug!("failed to install eyre error hook: {e}");
         }
     }
-
-    Ok(())
 }

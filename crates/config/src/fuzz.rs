@@ -1,14 +1,14 @@
-//! Configuration for fuzz testing
-
-use ethers_core::types::U256;
-use serde::{Deserialize, Serialize};
+//! Configuration for fuzz testing.
 
 use crate::inline::{
     parse_config_u32, InlineConfigParser, InlineConfigParserError, INLINE_CONFIG_FUZZ_KEY,
 };
+use alloy_primitives::U256;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Contains for fuzz testing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzConfig {
     /// The number of test cases that must execute for each property test
     pub runs: u32,
@@ -19,22 +19,43 @@ pub struct FuzzConfig {
     /// `prop_filter`.
     pub max_test_rejects: u32,
     /// Optional seed for the fuzzing RNG algorithm
-    #[serde(
-        deserialize_with = "ethers_core::types::serde_helpers::deserialize_stringified_numeric_opt"
-    )]
     pub seed: Option<U256>,
     /// The fuzz dictionary configuration
     #[serde(flatten)]
     pub dictionary: FuzzDictionaryConfig,
+    /// Number of runs to execute and include in the gas report.
+    pub gas_report_samples: u32,
+    /// Path where fuzz failures are recorded and replayed.
+    pub failure_persist_dir: Option<PathBuf>,
+    /// Name of the file to record fuzz failures, defaults to `failures`.
+    pub failure_persist_file: Option<String>,
 }
 
 impl Default for FuzzConfig {
     fn default() -> Self {
-        FuzzConfig {
+        Self {
             runs: 256,
             max_test_rejects: 65536,
             seed: None,
             dictionary: FuzzDictionaryConfig::default(),
+            gas_report_samples: 256,
+            failure_persist_dir: None,
+            failure_persist_file: None,
+        }
+    }
+}
+
+impl FuzzConfig {
+    /// Creates fuzz configuration to write failures in `{PROJECT_ROOT}/cache/fuzz` dir.
+    pub fn new(cache_dir: PathBuf) -> Self {
+        Self {
+            runs: 256,
+            max_test_rejects: 65536,
+            seed: None,
+            dictionary: FuzzDictionaryConfig::default(),
+            gas_report_samples: 256,
+            failure_persist_dir: Some(cache_dir),
+            failure_persist_file: Some("failures".to_string()),
         }
     }
 }
@@ -51,8 +72,7 @@ impl InlineConfigParser for FuzzConfig {
             return Ok(None)
         }
 
-        // self is Copy. We clone it with dereference.
-        let mut conf_clone = *self;
+        let mut conf_clone = self.clone();
 
         for pair in overrides {
             let key = pair.0;
@@ -63,6 +83,7 @@ impl InlineConfigParser for FuzzConfig {
                 "dictionary-weight" => {
                     conf_clone.dictionary.dictionary_weight = parse_config_u32(key, value)?
                 }
+                "failure-persist-file" => conf_clone.failure_persist_file = Some(value),
                 _ => Err(InlineConfigParserError::InvalidConfigProperty(key))?,
             }
         }
@@ -71,7 +92,7 @@ impl InlineConfigParser for FuzzConfig {
 }
 
 /// Contains for fuzz testing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzDictionaryConfig {
     /// The weight of the dictionary
     #[serde(deserialize_with = "crate::deserialize_stringified_percent")]
@@ -94,7 +115,7 @@ pub struct FuzzDictionaryConfig {
 
 impl Default for FuzzDictionaryConfig {
     fn default() -> Self {
-        FuzzDictionaryConfig {
+        Self {
             dictionary_weight: 40,
             include_storage: true,
             include_push_bytes: true,
@@ -126,11 +147,13 @@ mod tests {
         let configs = &[
             "forge-config: default.fuzz.runs = 42424242".to_string(),
             "forge-config: default.fuzz.dictionary-weight = 42".to_string(),
+            "forge-config: default.fuzz.failure-persist-file = fuzz-failure".to_string(),
         ];
         let base_config = FuzzConfig::default();
         let merged: FuzzConfig = base_config.try_merge(configs).expect("No errors").unwrap();
         assert_eq!(merged.runs, 42424242);
         assert_eq!(merged.dictionary.dictionary_weight, 42);
+        assert_eq!(merged.failure_persist_file, Some("fuzz-failure".to_string()));
     }
 
     #[test]

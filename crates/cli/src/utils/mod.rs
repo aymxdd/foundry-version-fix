@@ -1,30 +1,27 @@
-use ethers::{
-    abi::token::{LenientTokenizer, Tokenizer},
-    prelude::TransactionReceipt,
-    providers::Middleware,
-    types::U256,
-    utils::{format_units, to_checksum},
-};
-use eyre::Result;
+use alloy_json_abi::JsonAbi;
+use alloy_primitives::U256;
+use alloy_provider::{network::AnyNetwork, Provider};
+use alloy_transport::Transport;
+use eyre::{ContextCompat, Result};
+use foundry_common::provider::{ProviderBuilder, RetryProvider};
 use foundry_config::{Chain, Config};
 use std::{
     ffi::OsStr,
     future::Future,
-    ops::Mul,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
-use yansi::Paint;
 
 mod cmd;
 pub use cmd::*;
 
 mod suggestions;
 pub use suggestions::*;
+
+mod abi;
+pub use abi::*;
 
 // reexport all `foundry_config::utils`
 #[doc(hidden)]
@@ -33,7 +30,7 @@ pub use foundry_config::utils::*;
 /// Deterministic fuzzer seed used for gas snapshots and coverage reports.
 ///
 /// The keccak256 hash of "foundry rulez"
-pub static STATIC_FUZZ_SEED: [u8; 32] = [
+pub const STATIC_FUZZ_SEED: [u8; 32] = [
     0x01, 0x00, 0xfa, 0x69, 0xa5, 0xf1, 0x71, 0x0a, 0x95, 0xcd, 0xef, 0x94, 0x88, 0x9b, 0x02, 0x84,
     0x5d, 0x64, 0x0b, 0x19, 0xad, 0xf0, 0xe3, 0x57, 0xb8, 0xd4, 0xbe, 0x7d, 0x49, 0xee, 0x70, 0xe6,
 ];
@@ -69,36 +66,36 @@ impl<T: AsRef<Path>> FoundryPathExt for T {
 }
 
 /// Initializes a tracing Subscriber for logging
-#[allow(dead_code)]
 pub fn subscriber() {
-    tracing_subscriber::Registry::default()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(ErrorLayer::default())
-        .with(tracing_subscriber::fmt::layer())
-        .init()
+    let registry = tracing_subscriber::Registry::default()
+        .with(tracing_subscriber::EnvFilter::from_default_env());
+    #[cfg(feature = "tracy")]
+    let registry = registry.with(tracing_tracy::TracyLayer::default());
+    registry.with(tracing_subscriber::fmt::layer()).init()
 }
 
-/// parse a hex str or decimal str as U256
-pub fn parse_u256(s: &str) -> Result<U256> {
-    Ok(if s.starts_with("0x") { U256::from_str(s)? } else { U256::from_dec_str(s)? })
+pub fn abi_to_solidity(abi: &JsonAbi, name: &str) -> Result<String> {
+    let s = abi.to_sol(name, None);
+    let s = forge_fmt::format(&s)?;
+    Ok(s)
 }
 
-/// Returns a [RetryProvider](foundry_common::RetryProvider) instantiated using [Config]'s RPC URL
-/// and chain.
-///
-/// Defaults to `http://localhost:8545` and `Mainnet`.
-pub fn get_provider(config: &Config) -> Result<foundry_common::RetryProvider> {
+/// Returns a [RetryProvider] instantiated using [Config]'s
+/// RPC
+pub fn get_provider(config: &Config) -> Result<RetryProvider> {
     get_provider_builder(config)?.build()
 }
 
-/// Returns a [ProviderBuilder](foundry_common::ProviderBuilder) instantiated using [Config]'s RPC
-/// URL and chain.
+/// Returns a [ProviderBuilder] instantiated using [Config] values.
 ///
 /// Defaults to `http://localhost:8545` and `Mainnet`.
-pub fn get_provider_builder(config: &Config) -> Result<foundry_common::ProviderBuilder> {
+pub fn get_provider_builder(config: &Config) -> Result<ProviderBuilder> {
     let url = config.get_rpc_url_or_localhost_http()?;
-    let chain = config.chain_id.unwrap_or_default();
-    let mut builder = foundry_common::ProviderBuilder::new(url.as_ref()).chain(chain);
+    let mut builder = ProviderBuilder::new(url.as_ref());
+
+    if let Ok(chain) = config.chain.unwrap_or_default().try_into() {
+        builder = builder.chain(chain);
+    }
 
     let jwt = config.get_rpc_jwt_secret()?;
     if let Some(jwt) = jwt {
@@ -108,14 +105,14 @@ pub fn get_provider_builder(config: &Config) -> Result<foundry_common::ProviderB
     Ok(builder)
 }
 
-pub async fn get_chain<M>(chain: Option<Chain>, provider: M) -> Result<Chain>
+pub async fn get_chain<P, T>(chain: Option<Chain>, provider: P) -> Result<Chain>
 where
-    M: Middleware,
-    M::Error: 'static,
+    P: Provider<T, AnyNetwork>,
+    T: Transport + Clone,
 {
     match chain {
         Some(chain) => Ok(chain),
-        None => Ok(Chain::Id(provider.get_chainid().await?.as_u64())),
+        None => Ok(Chain::from_id(provider.get_chain_id().await?)),
     }
 }
 
@@ -127,9 +124,12 @@ where
 /// it is interpreted as wei.
 pub fn parse_ether_value(value: &str) -> Result<U256> {
     Ok(if value.starts_with("0x") {
-        U256::from_str(value)?
+        U256::from_str_radix(value, 16)?
     } else {
-        U256::from(LenientTokenizer::tokenize_uint(value)?)
+        alloy_dyn_abi::DynSolType::coerce_str(&alloy_dyn_abi::DynSolType::Uint(256), value)?
+            .as_uint()
+            .wrap_err("Could not parse ether value from string")?
+            .0
     })
 }
 
@@ -156,7 +156,6 @@ pub fn now() -> Duration {
 }
 
 /// Runs the `future` in a new [`tokio::runtime::Runtime`]
-#[allow(unused)]
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let rt = tokio::runtime::Runtime::new().expect("could not start tokio rt");
     rt.block_on(future)
@@ -181,7 +180,7 @@ macro_rules! p_println {
 
 /// Loads a dotenv file, from the cwd and the project root, ignoring potential failure.
 ///
-/// We could use `tracing::warn!` here, but that would imply that the dotenv file can't configure
+/// We could use `warn!` here, but that would imply that the dotenv file can't configure
 /// the logging behavior of Foundry.
 ///
 /// Similarly, we could just use `eprintln!`, but colors are off limits otherwise dotenv is implied
@@ -203,49 +202,10 @@ pub fn load_dotenv() {
     };
 }
 
-/// Disables terminal colours if either:
-/// - Running windows and the terminal does not support colour codes.
-/// - Colour has been disabled by some environment variable.
-/// - We are running inside a test
+/// Sets the default [`yansi`] color output condition.
 pub fn enable_paint() {
-    let is_windows = cfg!(windows) && !Paint::enable_windows_ascii();
-    let env_colour_disabled = std::env::var("NO_COLOR").is_ok();
-    if is_windows || env_colour_disabled {
-        Paint::disable();
-    }
-}
-
-/// Prints parts of the receipt to stdout
-pub fn print_receipt(chain: Chain, receipt: &TransactionReceipt) {
-    let gas_used = receipt.gas_used.unwrap_or_default();
-    let gas_price = receipt.effective_gas_price.unwrap_or_default();
-    foundry_common::shell::println(format!(
-        "\n##### {chain}\n{status}Hash: {tx_hash:?}{caddr}\nBlock: {bn}\n{gas}\n",
-        status = if receipt.status.map_or(true, |s| s.is_zero()) {
-            "❌  [Failed]"
-        } else {
-            "✅  [Success]"
-        },
-        tx_hash = receipt.transaction_hash,
-        caddr = if let Some(addr) = &receipt.contract_address {
-            format!("\nContract Address: {}", to_checksum(addr, None))
-        } else {
-            String::new()
-        },
-        bn = receipt.block_number.unwrap_or_default(),
-        gas = if gas_price.is_zero() {
-            format!("Gas Used: {gas_used}")
-        } else {
-            let paid = format_units(gas_used.mul(gas_price), 18).unwrap_or_else(|_| "N/A".into());
-            let gas_price = format_units(gas_price, 9).unwrap_or_else(|_| "N/A".into());
-            format!(
-                "Paid: {} ETH ({gas_used} gas * {} gwei)",
-                paid.trim_end_matches('0'),
-                gas_price.trim_end_matches('0').trim_end_matches('.')
-            )
-        },
-    ))
-    .expect("could not print receipt");
+    let enable = yansi::Condition::os_support() && yansi::Condition::tty_and_color_live();
+    yansi::whenever(yansi::Condition::cached(enable));
 }
 
 /// Useful extensions to [`std::process::Command`].
@@ -260,21 +220,26 @@ pub trait CommandUtils {
 impl CommandUtils for Command {
     #[track_caller]
     fn exec(&mut self) -> Result<Output> {
-        tracing::trace!(command=?self, "executing");
+        trace!(command=?self, "executing");
 
         let output = self.output()?;
 
-        tracing::trace!(code=?output.status.code(), ?output);
+        trace!(code=?output.status.code(), ?output);
 
         if output.status.success() {
             Ok(output)
         } else {
-            let mut stderr = String::from_utf8_lossy(&output.stderr);
-            let mut msg = stderr.trim();
-            if msg.is_empty() {
-                stderr = String::from_utf8_lossy(&output.stdout);
-                msg = stderr.trim();
-            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = stdout.trim();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let msg = if stdout.is_empty() {
+                stderr.to_string()
+            } else if stderr.is_empty() {
+                stdout.to_string()
+            } else {
+                format!("stdout:\n{stdout}\n\nstderr:\n{stderr}")
+            };
 
             let mut name = self.get_program().to_string_lossy();
             if let Some(arg) = self.get_args().next() {
@@ -291,8 +256,9 @@ impl CommandUtils for Command {
                 None => format!("{name} terminated by a signal"),
             };
             if !msg.is_empty() {
-                err.push_str(": ");
-                err.push_str(msg);
+                err.push(':');
+                err.push(if msg.lines().count() == 0 { ' ' } else { '\n' });
+                err.push_str(&msg);
             }
             Err(eyre::eyre!(err))
         }
@@ -321,7 +287,7 @@ impl<'a> Git<'a> {
 
     #[inline]
     pub fn from_config(config: &'a Config) -> Self {
-        Self::new(config.__root.0.as_path())
+        Self::new(config.root.0.as_path())
     }
 
     pub fn root_of(relative_to: &Path) -> Result<PathBuf> {
@@ -367,6 +333,23 @@ impl<'a> Git<'a> {
             .map(drop)
     }
 
+    pub fn fetch(
+        self,
+        shallow: bool,
+        remote: impl AsRef<OsStr>,
+        branch: Option<impl AsRef<OsStr>>,
+    ) -> Result<()> {
+        self.cmd()
+            .stderr(Stdio::inherit())
+            .arg("fetch")
+            .args(shallow.then_some("--no-tags"))
+            .args(shallow.then_some("--depth=1"))
+            .arg(remote)
+            .args(branch)
+            .exec()
+            .map(drop)
+    }
+
     #[inline]
     pub fn root(self, root: &Path) -> Git<'_> {
         Git { root, ..self }
@@ -405,6 +388,23 @@ impl<'a> Git<'a> {
         self.cmd().arg("add").args(paths).exec().map(drop)
     }
 
+    pub fn reset(self, hard: bool, tree: impl AsRef<OsStr>) -> Result<()> {
+        self.cmd().arg("reset").args(hard.then_some("--hard")).arg(tree).exec().map(drop)
+    }
+
+    pub fn commit_tree(
+        self,
+        tree: impl AsRef<OsStr>,
+        msg: Option<impl AsRef<OsStr>>,
+    ) -> Result<String> {
+        self.cmd()
+            .arg("commit-tree")
+            .arg(tree)
+            .args(msg.as_ref().is_some().then_some("-m"))
+            .args(msg)
+            .get_stdout_lossy()
+    }
+
     pub fn rm<I, S>(self, force: bool, paths: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -430,7 +430,7 @@ impl<'a> Git<'a> {
                     output.status.code(),
                     stdout.trim(),
                     stderr.trim()
-                ))
+                ));
             }
         }
         Ok(())
@@ -471,8 +471,12 @@ https://github.com/foundry-rs/foundry/issues/new/choose"
         }
     }
 
-    pub fn commit_hash(self, short: bool) -> Result<String> {
-        self.cmd().arg("rev-parse").args(short.then_some("--short")).arg("HEAD").get_stdout_lossy()
+    pub fn commit_hash(self, short: bool, revision: &str) -> Result<String> {
+        self.cmd()
+            .arg("rev-parse")
+            .args(short.then_some("--short"))
+            .arg(revision)
+            .get_stdout_lossy()
     }
 
     pub fn tag(self) -> Result<String> {
@@ -489,6 +493,19 @@ https://github.com/foundry-rs/foundry/issues/new/choose"
             .args(paths)
             .get_stdout_lossy()
             .map(|stdout| stdout.lines().any(|line| line.starts_with('-')))
+    }
+
+    /// Returns true if the given path has no submodules by checking `git submodule status`
+    pub fn has_submodules<I, S>(self, paths: I) -> Result<bool>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.cmd()
+            .args(["submodule", "status"])
+            .args(paths)
+            .get_stdout_lossy()
+            .map(|stdout| stdout.trim().lines().next().is_some())
     }
 
     pub fn submodule_add(
@@ -508,20 +525,43 @@ https://github.com/foundry-rs/foundry/issues/new/choose"
             .map(drop)
     }
 
-    pub fn submodule_update<I, S>(self, force: bool, remote: bool, paths: I) -> Result<()>
+    pub fn submodule_update<I, S>(
+        self,
+        force: bool,
+        remote: bool,
+        no_fetch: bool,
+        recursive: bool,
+        paths: I,
+    ) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         self.cmd()
             .stderr(self.stderr())
-            .args(["submodule", "update", "--progress", "--init", "--recursive"])
+            .args(["submodule", "update", "--progress", "--init"])
             .args(self.shallow.then_some("--depth=1"))
             .args(force.then_some("--force"))
             .args(remote.then_some("--remote"))
+            .args(no_fetch.then_some("--no-fetch"))
+            .args(recursive.then_some("--recursive"))
             .args(paths)
             .exec()
             .map(drop)
+    }
+
+    pub fn submodule_foreach(self, recursive: bool, cmd: impl AsRef<OsStr>) -> Result<()> {
+        self.cmd()
+            .stderr(self.stderr())
+            .args(["submodule", "foreach"])
+            .args(recursive.then_some("--recursive"))
+            .arg(cmd)
+            .exec()
+            .map(drop)
+    }
+
+    pub fn submodule_init(self) -> Result<()> {
+        self.cmd().stderr(self.stderr()).args(["submodule", "init"]).exec().map(drop)
     }
 
     pub fn cmd(self) -> Command {

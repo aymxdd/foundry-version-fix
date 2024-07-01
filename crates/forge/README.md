@@ -386,7 +386,7 @@ Logs:
 
 If you are working in a repo with NPM-style imports, like
 
-```
+```solidity
 import "@openzeppelin/contracts/access/Ownable.sol";
 ```
 
@@ -398,13 +398,13 @@ For example, if you have `@openzeppelin` imports, you would
 2. Create a remappings file: `touch remappings.txt`
 3. Add this line to `remappings.txt`
 
-```
+```text
 @openzeppelin/=lib/openzeppelin-contracts/
 ```
 
 ## Github Actions CI
 
-We recommend using the [Github Actions CI setup](https://book.getfoundry.sh/config/continous-integration.html) from the [📖 Foundry Book](https://book.getfoundry.sh/index.html).
+We recommend using the [Github Actions CI setup](https://book.getfoundry.sh/config/continuous-integration) from the [📖 Foundry Book](https://book.getfoundry.sh/index.html).
 
 ## Future Features
 

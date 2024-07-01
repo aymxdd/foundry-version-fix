@@ -1,49 +1,49 @@
 use super::install::DependencyInstallOpts;
 use clap::{Parser, ValueHint};
-use ethers::solc::remappings::Remapping;
 use eyre::Result;
 use foundry_cli::{p_println, utils::Git};
 use foundry_common::fs;
+use foundry_compilers::artifacts::remappings::Remapping;
 use foundry_config::Config;
 use std::path::{Path, PathBuf};
 use yansi::Paint;
 
 /// CLI arguments for `forge init`.
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Debug, Default, Parser)]
 pub struct InitArgs {
     /// The root directory of the new project.
-    #[clap(value_hint = ValueHint::DirPath, default_value = ".", value_name = "PATH")]
-    root: PathBuf,
+    #[arg(value_hint = ValueHint::DirPath, default_value = ".", value_name = "PATH")]
+    pub root: PathBuf,
 
     /// The template to start from.
-    #[clap(long, short)]
-    template: Option<String>,
+    #[arg(long, short)]
+    pub template: Option<String>,
 
     /// Branch argument that can only be used with template option.
     /// If not specified, the default branch is used.
-    #[clap(long, short, requires = "template")]
-    branch: Option<String>,
+    #[arg(long, short, requires = "template")]
+    pub branch: Option<String>,
 
     /// Do not install dependencies from the network.
-    #[clap(long, conflicts_with = "template", visible_alias = "no-deps")]
-    offline: bool,
+    #[arg(long, conflicts_with = "template", visible_alias = "no-deps")]
+    pub offline: bool,
 
     /// Create the project even if the specified root directory is not empty.
-    #[clap(long, conflicts_with = "template")]
-    force: bool,
+    #[arg(long, conflicts_with = "template")]
+    pub force: bool,
 
     /// Create a .vscode/settings.json file with Solidity settings, and generate a remappings.txt
     /// file.
-    #[clap(long, conflicts_with = "template")]
-    vscode: bool,
+    #[arg(long, conflicts_with = "template")]
+    pub vscode: bool,
 
-    #[clap(flatten)]
-    opts: DependencyInstallOpts,
+    #[command(flatten)]
+    pub opts: DependencyInstallOpts,
 }
 
 impl InitArgs {
     pub fn run(self) -> Result<()> {
-        let InitArgs { root, template, branch, opts, offline, force, vscode } = self;
+        let Self { root, template, branch, opts, offline, force, vscode } = self;
         let DependencyInstallOpts { shallow, no_git, no_commit, quiet } = opts;
 
         // create the root dir if it does not exist
@@ -53,9 +53,9 @@ impl InitArgs {
         let root = dunce::canonicalize(root)?;
         let git = Git::new(&root).quiet(quiet).shallow(shallow);
 
-        // if a template is provided, then this command clones the template repo, removes the .git
-        // folder, and initializes a new git repo—-this ensures there is no history from the
-        // template and the template is not set as a remote.
+        // if a template is provided, then this command initializes a git repo,
+        // fetches the template repo, and resets the git history to the head of the fetched
+        // repo with no other history
         if let Some(template) = template {
             let template = if template.contains("://") {
                 template
@@ -63,20 +63,29 @@ impl InitArgs {
                 "https://github.com/".to_string() + &template
             };
             p_println!(!quiet => "Initializing {} from {}...", root.display(), template);
-
-            if let Some(branch) = branch {
-                Git::clone_with_branch(shallow, &template, branch, Some(&root))?;
-            } else {
-                Git::clone(shallow, &template, Some(&root))?;
-            }
-            // Modify the git history.
-            let commit_hash = git.commit_hash(true)?;
-            std::fs::remove_dir_all(".git")?;
-
+            // initialize the git repository
             git.init()?;
-            git.add(Some("--all"))?;
+
+            // fetch the template - always fetch shallow for templates since git history will be
+            // collapsed. gitmodules will be initialized after the template is fetched
+            git.fetch(true, &template, branch)?;
+            // reset git history to the head of the template
+            // first get the commit hash that was fetched
+            let commit_hash = git.commit_hash(true, "FETCH_HEAD")?;
+            // format a commit message for the new repo
             let commit_msg = format!("chore: init from {template} at {commit_hash}");
-            git.commit(&commit_msg)?;
+            // get the hash of the FETCH_HEAD with the new commit message
+            let new_commit_hash = git.commit_tree("FETCH_HEAD^{tree}", Some(commit_msg))?;
+            // reset head of this repo to be the head of the template repo
+            git.reset(true, new_commit_hash)?;
+
+            // if shallow, just initialize submodules
+            if shallow {
+                git.submodule_init()?;
+            } else {
+                // if not shallow, initialize and clone submodules (without fetching latest)
+                git.submodule_update(false, false, true, true, std::iter::empty::<PathBuf>())?;
+            }
         } else {
             // if target is not empty
             if root.read_dir().map_or(false, |mut i| i.next().is_some()) {
@@ -150,14 +159,9 @@ impl InitArgs {
             }
         }
 
-        p_println!(!quiet => "    {} forge project",   Paint::green("Initialized"));
+        p_println!(!quiet => "    {} forge project",  "Initialized".green());
         Ok(())
     }
-}
-
-/// Returns the commit hash of the project if it exists
-pub fn get_commit_hash(root: &Path) -> Option<String> {
-    Git::new(root).commit_hash(true).ok()
 }
 
 /// Initialises `root` as a git repository, if it isn't one already.
@@ -197,7 +201,7 @@ fn init_git_repo(git: Git<'_>, no_commit: bool) -> Result<()> {
 fn init_vscode(root: &Path) -> Result<()> {
     let remappings_file = root.join("remappings.txt");
     if !remappings_file.exists() {
-        let mut remappings = Remapping::find_many(root.join("lib"))
+        let mut remappings = Remapping::find_many(&root.join("lib"))
             .into_iter()
             .map(|r| r.into_relative(root).to_relative_remapping().to_string())
             .collect::<Vec<_>>();
@@ -214,7 +218,7 @@ fn init_vscode(root: &Path) -> Result<()> {
         fs::create_dir_all(&vscode_dir)?;
         serde_json::json!({})
     } else if settings_file.exists() {
-        ethers::solc::utils::read_json_file(&settings_file)?
+        foundry_compilers::utils::read_json_file(&settings_file)?
     } else {
         serde_json::json!({})
     };

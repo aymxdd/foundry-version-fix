@@ -4,7 +4,6 @@ use eyre::Result;
 use foundry_cli::utils::{self, FoundryPathExt};
 use foundry_config::Config;
 use std::{collections::HashSet, convert::Infallible, path::PathBuf, sync::Arc};
-use tracing::trace;
 use watchexec::{
     action::{Action, Outcome, PreSpawn},
     command::Command,
@@ -16,13 +15,13 @@ use watchexec::{
     Watchexec,
 };
 
-#[derive(Debug, Clone, Parser, Default)]
-#[clap(next_help_heading = "Watch options")]
+#[derive(Clone, Debug, Default, Parser)]
+#[command(next_help_heading = "Watch options")]
 pub struct WatchArgs {
     /// Watch the given files or directories for changes.
     ///
     /// If no paths are provided, the source and test directories of the project are watched.
-    #[clap(
+    #[arg(
         long,
         short,
         num_args(0..),
@@ -31,13 +30,13 @@ pub struct WatchArgs {
     pub watch: Option<Vec<PathBuf>>,
 
     /// Do not restart the command while it's still running.
-    #[clap(long)]
+    #[arg(long)]
     pub no_restart: bool,
 
     /// Explicitly re-run all tests when a change is made.
     ///
     /// By default, only the tests of the last modified test file are executed.
-    #[clap(long)]
+    #[arg(long)]
     pub run_all: bool,
 
     /// File update debounce delay.
@@ -53,7 +52,7 @@ pub struct WatchArgs {
     ///
     /// When using --poll mode, you'll want a larger duration, or risk
     /// overloading disk I/O.
-    #[clap(long, value_name = "DELAY")]
+    #[arg(long, value_name = "DELAY")]
     pub watch_delay: Option<String>,
 }
 
@@ -138,7 +137,7 @@ pub async fn watch_test(args: TestArgs) -> Result<()> {
         args.watch.run_all;
 
     let state = WatchTestState {
-        project_root: config.__root.0,
+        project_root: config.root.0,
         no_reconfigure,
         last_test_files: Default::default(),
     };
@@ -151,7 +150,7 @@ pub async fn watch_test(args: TestArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct WatchTestState {
     /// the root directory of the project
     project_root: PathBuf,
@@ -164,7 +163,7 @@ struct WatchTestState {
 }
 
 /// The `on_action` hook for `forge test --watch`
-fn on_test(action: OnActionState<WatchTestState>) {
+fn on_test(action: OnActionState<'_, WatchTestState>) {
     let OnActionState { args, runtime, action, wx, cmd, other } = action;
     let WatchTestState { project_root, no_reconfigure, last_test_files } = other;
 
@@ -263,10 +262,38 @@ fn watch_command(mut args: Vec<String>) -> Command {
 
 /// Returns the env args without the `--watch` flag from the args for the Watchexec command
 fn cmd_args(num: usize) -> Vec<String> {
-    // all the forge arguments including path to forge bin
-    let mut cmd_args: Vec<_> = std::env::args().collect();
+    clean_cmd_args(num, std::env::args().collect())
+}
+
+#[instrument(level = "debug", ret)]
+fn clean_cmd_args(num: usize, mut cmd_args: Vec<String>) -> Vec<String> {
     if let Some(pos) = cmd_args.iter().position(|arg| arg == "--watch" || arg == "-w") {
         cmd_args.drain(pos..=(pos + num));
+    }
+
+    // There's another edge case where short flags are combined into one which is supported by clap,
+    // like `-vw` for verbosity and watch
+    // this removes any `w` from concatenated short flags
+    if let Some(pos) = cmd_args.iter().position(|arg| {
+        fn contains_w_in_short(arg: &str) -> Option<bool> {
+            let mut iter = arg.chars().peekable();
+            if *iter.peek()? != '-' {
+                return None
+            }
+            iter.next();
+            if *iter.peek()? == '-' {
+                return None
+            }
+            Some(iter.any(|c| c == 'w'))
+        }
+        contains_w_in_short(arg).unwrap_or(false)
+    }) {
+        let clean_arg = cmd_args[pos].replace('w', "");
+        if clean_arg == "-" {
+            cmd_args.remove(pos);
+        } else {
+            cmd_args[pos] = clean_arg;
+        }
     }
 
     cmd_args
@@ -275,9 +302,9 @@ fn cmd_args(num: usize) -> Vec<String> {
 /// Returns the Initialisation configuration for [`Watchexec`].
 pub fn init() -> Result<InitConfig> {
     let mut config = InitConfig::default();
-    config.on_error(SyncFnHandler::from(|data| -> std::result::Result<(), Infallible> {
+    config.on_error(SyncFnHandler::from(|data| {
         trace!("[[{:?}]]", data);
-        Ok(())
+        Ok::<_, Infallible>(())
     }));
 
     Ok(config)
@@ -338,20 +365,20 @@ fn on_action<F, T>(
             if let Some(status) = completion {
                 match status {
                     Some(ProcessEnd::ExitError(code)) => {
-                        tracing::trace!("Command exited with {code}")
+                        trace!("Command exited with {code}")
                     }
                     Some(ProcessEnd::ExitSignal(sig)) => {
-                        tracing::trace!("Command killed by {:?}", sig)
+                        trace!("Command killed by {:?}", sig)
                     }
                     Some(ProcessEnd::ExitStop(sig)) => {
-                        tracing::trace!("Command stopped by {:?}", sig)
+                        trace!("Command stopped by {:?}", sig)
                     }
-                    Some(ProcessEnd::Continued) => tracing::trace!("Command continued"),
+                    Some(ProcessEnd::Continued) => trace!("Command continued"),
                     Some(ProcessEnd::Exception(ex)) => {
-                        tracing::trace!("Command ended by exception {:#x}", ex)
+                        trace!("Command ended by exception {:#x}", ex)
                     }
-                    Some(ProcessEnd::Success) => tracing::trace!("Command was successful"),
-                    None => tracing::trace!("Command completed"),
+                    Some(ProcessEnd::Success) => trace!("Command was successful"),
+                    None => trace!("Command completed"),
                 };
 
                 action.outcome(Outcome::DoNothing);
@@ -412,4 +439,16 @@ pub fn runtime(args: &WatchArgs) -> Result<RuntimeConfig> {
     });
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cmd_args() {
+        let args = vec!["-vw".to_string()];
+        let cleaned = clean_cmd_args(0, args);
+        assert_eq!(cleaned, vec!["-v".to_string()]);
+    }
 }

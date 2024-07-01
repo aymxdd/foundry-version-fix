@@ -1,15 +1,20 @@
 //! Utility functions
 
 use crate::Config;
-use ethers_core::types::{serde_helpers::Numeric, U256};
-use ethers_solc::remappings::{Remapping, RemappingError};
+use alloy_primitives::U256;
+use eyre::WrapErr;
 use figment::value::Value;
+use foundry_compilers::artifacts::{
+    remappings::{Remapping, RemappingError},
+    EvmVersion,
+};
+use revm_primitives::SpecId;
 use serde::{de::Error, Deserialize, Deserializer};
 use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
-use toml_edit::{Document, Item};
+use toml_edit::{DocumentMut, Item};
 
 /// Loads the config for the current project workspace
 pub fn load_config() -> Config {
@@ -29,10 +34,14 @@ pub fn load_config_with_root(root: Option<PathBuf>) -> Config {
 /// Returns the path of the top-level directory of the working git tree. If there is no working
 /// tree, an error is returned.
 pub fn find_git_root_path(relative_to: impl AsRef<Path>) -> eyre::Result<PathBuf> {
+    let path = relative_to.as_ref();
     let path = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(relative_to.as_ref())
-        .output()?
+        .current_dir(path)
+        .output()
+        .wrap_err_with(|| {
+            format!("Failed detect git root path in current dir: {}", path.display())
+        })?
         .stdout;
     let path = std::str::from_utf8(&path)?.trim_end_matches('\n');
     Ok(PathBuf::from(path))
@@ -151,7 +160,7 @@ pub fn foundry_toml_dirs(root: impl AsRef<Path>) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_dir())
-        .filter_map(|e| ethers_solc::utils::canonicalize(e.path()).ok())
+        .filter_map(|e| foundry_compilers::utils::canonicalize(e.path()).ok())
         .filter(|p| p.join(Config::FILE_NAME).exists())
         .collect()
 }
@@ -194,7 +203,7 @@ pub fn get_available_profiles(toml_path: impl AsRef<Path>) -> eyre::Result<Vec<S
     let doc = read_toml(toml_path)?;
 
     if let Some(Item::Table(profiles)) = doc.as_table().get(Config::PROFILE_SECTION) {
-        for (_, (profile, _)) in profiles.iter().enumerate() {
+        for (profile, _) in profiles {
             let p = profile.to_string();
             if !result.contains(&p) {
                 result.push(p);
@@ -207,9 +216,9 @@ pub fn get_available_profiles(toml_path: impl AsRef<Path>) -> eyre::Result<Vec<S
 
 /// Returns a [`toml_edit::Document`] loaded from the provided `path`.
 /// Can raise an error in case of I/O or parsing errors.
-fn read_toml(path: impl AsRef<Path>) -> eyre::Result<Document> {
+fn read_toml(path: impl AsRef<Path>) -> eyre::Result<DocumentMut> {
     let path = path.as_ref().to_owned();
-    let doc: Document = std::fs::read_to_string(path)?.parse()?;
+    let doc: DocumentMut = std::fs::read_to_string(path)?.parse()?;
     Ok(doc)
 }
 
@@ -218,8 +227,7 @@ pub(crate) fn deserialize_stringified_percent<'de, D>(deserializer: D) -> Result
 where
     D: Deserializer<'de>,
 {
-    let num: U256 =
-        Numeric::deserialize(deserializer)?.try_into().map_err(serde::de::Error::custom)?;
+    let num: U256 = Numeric::deserialize(deserializer)?.into();
     let num: u64 = num.try_into().map_err(serde::de::Error::custom)?;
     if num <= 100 {
         num.try_into().map_err(serde::de::Error::custom)
@@ -228,31 +236,81 @@ where
     }
 }
 
-/// Deserialize an usize or
-pub(crate) fn deserialize_usize_or_max<'de, D>(deserializer: D) -> Result<usize, D::Error>
+/// Deserialize a `u64` or "max" for `u64::MAX`.
+pub(crate) fn deserialize_u64_or_max<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Val {
-        Number(usize),
-        Text(String),
+        Number(u64),
+        String(String),
     }
 
-    let num = match Val::deserialize(deserializer)? {
-        Val::Number(num) => num,
-        Val::Text(s) => {
-            match s.as_str() {
-                "max" | "MAX" | "Max" => {
-                    // toml limitation
-                    i64::MAX as usize
-                }
-                s => s.parse::<usize>().map_err(D::Error::custom).unwrap(),
-            }
+    match Val::deserialize(deserializer)? {
+        Val::Number(num) => Ok(num),
+        Val::String(s) if s.eq_ignore_ascii_case("max") => Ok(u64::MAX),
+        Val::String(s) => s.parse::<u64>().map_err(D::Error::custom),
+    }
+}
+
+/// Deserialize a `usize` or "max" for `usize::MAX`.
+pub(crate) fn deserialize_usize_or_max<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_u64_or_max(deserializer)?.try_into().map_err(D::Error::custom)
+}
+
+/// Helper type to parse both `u64` and `U256`
+#[derive(Clone, Copy, Deserialize)]
+#[serde(untagged)]
+pub enum Numeric {
+    /// A [U256] value.
+    U256(U256),
+    /// A `u64` value.
+    Num(u64),
+}
+
+impl From<Numeric> for U256 {
+    fn from(n: Numeric) -> Self {
+        match n {
+            Numeric::U256(n) => n,
+            Numeric::Num(n) => Self::from(n),
         }
-    };
-    Ok(num)
+    }
+}
+
+impl FromStr for Numeric {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.starts_with("0x") {
+            U256::from_str_radix(s, 16).map(Numeric::U256).map_err(|err| err.to_string())
+        } else {
+            U256::from_str(s).map(Numeric::U256).map_err(|err| err.to_string())
+        }
+    }
+}
+
+/// Returns the [SpecId] derived from [EvmVersion]
+#[inline]
+pub fn evm_spec_id(evm_version: &EvmVersion) -> SpecId {
+    match evm_version {
+        EvmVersion::Homestead => SpecId::HOMESTEAD,
+        EvmVersion::TangerineWhistle => SpecId::TANGERINE,
+        EvmVersion::SpuriousDragon => SpecId::SPURIOUS_DRAGON,
+        EvmVersion::Byzantium => SpecId::BYZANTIUM,
+        EvmVersion::Constantinople => SpecId::CONSTANTINOPLE,
+        EvmVersion::Petersburg => SpecId::PETERSBURG,
+        EvmVersion::Istanbul => SpecId::ISTANBUL,
+        EvmVersion::Berlin => SpecId::BERLIN,
+        EvmVersion::London => SpecId::LONDON,
+        EvmVersion::Paris => SpecId::MERGE,
+        EvmVersion::Shanghai => SpecId::SHANGHAI,
+        EvmVersion::Cancun => SpecId::CANCUN,
+    }
 }
 
 #[cfg(test)]
@@ -265,7 +323,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "foundry.toml",
-                r#"
+                r"
                 [foo.baz]
                 libs = ['node_modules', 'lib']
 
@@ -277,7 +335,7 @@ mod tests {
 
                 [profile.local]
                 libs = ['node_modules', 'lib']
-            "#,
+            ",
             )?;
 
             let path = Path::new("./foundry.toml");

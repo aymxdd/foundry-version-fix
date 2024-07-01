@@ -1,26 +1,28 @@
-use super::{debug::DebugArgs, install, test::filter::ProjectPathsAwareFilter, watch::WatchArgs};
+use super::{install, test::filter::ProjectPathsAwareFilter, watch::WatchArgs};
+use alloy_primitives::U256;
 use clap::Parser;
-use ethers::types::U256;
 use eyre::Result;
 use forge::{
     decode::decode_console_logs,
-    executor::inspector::CheatsConfig,
     gas_report::GasReport,
-    result::{SuiteResult, TestKind, TestResult, TestStatus},
-    trace::{
-        identifier::{EtherscanIdentifier, LocalTraceIdentifier, SignaturesIdentifier},
-        CallTraceDecoderBuilder, TraceKind,
-    },
-    MultiContractRunner, MultiContractRunnerBuilder, TestOptions, TestOptionsBuilder,
+    multi_runner::matches_contract,
+    result::{SuiteResult, TestOutcome, TestStatus},
+    traces::{identifier::SignaturesIdentifier, CallTraceDecoderBuilder, TraceKind},
+    MultiContractRunner, MultiContractRunnerBuilder, TestFilter, TestOptions, TestOptionsBuilder,
 };
 use foundry_cli::{
     opts::CoreBuildArgs,
     utils::{self, LoadConfig},
 };
 use foundry_common::{
-    compile::{self, ProjectCompiler},
+    compile::{ContractSources, ProjectCompiler},
     evm::EvmArgs,
-    get_contract_name, get_file_name, shell,
+    shell,
+};
+use foundry_compilers::{
+    artifacts::output_selection::OutputSelection,
+    compilers::{multi::MultiCompilerLanguage, CompilerSettings, Language},
+    utils::source_files_iter,
 };
 use foundry_config::{
     figment,
@@ -30,22 +32,31 @@ use foundry_config::{
     },
     get_available_profiles, Config,
 };
-use foundry_evm::{fuzz::CounterExample, utils::evm_spec};
+use foundry_debugger::Debugger;
+use foundry_evm::traces::identifier::TraceIdentifiers;
 use regex::Regex;
-use std::{collections::BTreeMap, path::PathBuf, sync::mpsc::channel, time::Duration};
-use tracing::trace;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::{mpsc::channel, Arc},
+    time::Instant,
+};
 use watchexec::config::{InitConfig, RuntimeConfig};
 use yansi::Paint;
 
 mod filter;
+mod summary;
+use summary::TestSummaryReporter;
+
 pub use filter::FilterArgs;
+use forge::traces::render_trace_arena;
 
 // Loads project's figment and merges the build cli arguments into it
 foundry_config::merge_impl_figment_convert!(TestArgs, opts, evm_opts);
 
 /// CLI arguments for `forge test`.
-#[derive(Debug, Clone, Parser)]
-#[clap(next_help_heading = "Test options")]
+#[derive(Clone, Debug, Parser)]
+#[command(next_help_heading = "Test options")]
 pub struct TestArgs {
     /// Run a test in the debugger.
     ///
@@ -62,51 +73,72 @@ pub struct TestArgs {
     /// If the fuzz test does not fail, it will open the debugger on the last fuzz case.
     ///
     /// For more fine-grained control of which fuzz case is run, see forge run.
-    #[clap(long, value_name = "TEST_FUNCTION")]
+    #[arg(long, value_name = "TEST_FUNCTION")]
     debug: Option<Regex>,
 
     /// Print a gas report.
-    #[clap(long, env = "FORGE_GAS_REPORT")]
+    #[arg(long, env = "FORGE_GAS_REPORT")]
     gas_report: bool,
 
     /// Exit with code 0 even if a test fails.
-    #[clap(long, env = "FORGE_ALLOW_FAILURE")]
+    #[arg(long, env = "FORGE_ALLOW_FAILURE")]
     allow_failure: bool,
 
     /// Output test results in JSON format.
-    #[clap(long, short, help_heading = "Display options")]
+    #[arg(long, short, help_heading = "Display options")]
     json: bool,
 
-    /// Stop running tests after the first failure
-    #[clap(long)]
+    /// Stop running tests after the first failure.
+    #[arg(long)]
     pub fail_fast: bool,
 
-    /// The Etherscan (or equivalent) API key
-    #[clap(long, env = "ETHERSCAN_API_KEY", value_name = "KEY")]
+    /// The Etherscan (or equivalent) API key.
+    #[arg(long, env = "ETHERSCAN_API_KEY", value_name = "KEY")]
     etherscan_api_key: Option<String>,
 
-    /// List tests instead of running them
-    #[clap(long, short, help_heading = "Display options")]
+    /// List tests instead of running them.
+    #[arg(long, short, help_heading = "Display options")]
     list: bool,
 
     /// Set seed used to generate randomness during your fuzz runs.
-    #[clap(long, value_parser = utils::parse_u256)]
+    #[arg(long)]
     pub fuzz_seed: Option<U256>,
 
-    #[clap(long, env = "FOUNDRY_FUZZ_RUNS", value_name = "RUNS")]
+    #[arg(long, env = "FOUNDRY_FUZZ_RUNS", value_name = "RUNS")]
     pub fuzz_runs: Option<u64>,
 
-    #[clap(flatten)]
+    /// File to rerun fuzz failures from.
+    #[arg(long)]
+    pub fuzz_input_file: Option<String>,
+
+    /// Max concurrent threads to use.
+    /// Default value is the number of available CPUs.
+    #[arg(long)]
+    pub max_threads: Option<u64>,
+
+    #[command(flatten)]
     filter: FilterArgs,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     evm_opts: EvmArgs,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     opts: CoreBuildArgs,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     pub watch: WatchArgs,
+
+    /// Print test summary table.
+    #[arg(long, help_heading = "Display options")]
+    pub summary: bool,
+
+    /// Print detailed test summary table.
+    #[arg(long, help_heading = "Display options", requires = "summary")]
+    pub detailed: bool,
+
+    /// Show test execution progress.
+    #[arg(long)]
+    pub show_progress: bool,
 }
 
 impl TestArgs {
@@ -121,6 +153,77 @@ impl TestArgs {
         self.execute_tests().await
     }
 
+    /// Returns sources which include any tests to be executed.
+    /// If no filters are provided, sources are filtered by existence of test/invariant methods in
+    /// them, If filters are provided, sources are additionaly filtered by them.
+    pub fn get_sources_to_compile(
+        &self,
+        config: &Config,
+        filter: &ProjectPathsAwareFilter,
+    ) -> Result<BTreeSet<PathBuf>> {
+        let mut project = config.create_project(true, true)?;
+        project.settings.update_output_selection(|selection| {
+            *selection = OutputSelection::common_output_selection(["abi".to_string()]);
+        });
+
+        let output = project.compile()?;
+
+        if output.has_compiler_errors() {
+            println!("{output}");
+            eyre::bail!("Compilation failed");
+        }
+
+        // ABIs of all sources
+        let abis = output
+            .into_artifacts()
+            .filter_map(|(id, artifact)| artifact.abi.map(|abi| (id, abi)))
+            .collect::<BTreeMap<_, _>>();
+
+        // Filter sources by their abis and contract names.
+        let mut test_sources = abis
+            .iter()
+            .filter(|(id, abi)| matches_contract(id, abi, filter))
+            .map(|(id, _)| id.source.clone())
+            .collect::<BTreeSet<_>>();
+
+        if test_sources.is_empty() {
+            if filter.is_empty() {
+                println!(
+                    "No tests found in project! \
+                        Forge looks for functions that starts with `test`."
+                );
+            } else {
+                println!("No tests match the provided pattern:");
+                print!("{filter}");
+
+                // Try to suggest a test when there's no match
+                if let Some(test_pattern) = &filter.args().test_pattern {
+                    let test_name = test_pattern.as_str();
+                    let candidates = abis
+                        .into_iter()
+                        .filter(|(id, _)| {
+                            filter.matches_path(&id.source) && filter.matches_contract(&id.name)
+                        })
+                        .flat_map(|(_, abi)| abi.functions.into_keys())
+                        .collect::<Vec<_>>();
+                    if let Some(suggestion) = utils::did_you_mean(test_name, candidates).pop() {
+                        println!("\nDid you mean `{suggestion}`?");
+                    }
+                }
+            }
+
+            eyre::bail!("No tests to run");
+        }
+
+        // Always recompile all sources to ensure that `getCode` cheatcode can use any artifact.
+        test_sources.extend(source_files_iter(
+            &project.paths.sources,
+            MultiCompilerLanguage::FILE_EXTENSIONS,
+        ));
+
+        Ok(test_sources)
+    }
+
     /// Executes all the tests in the project.
     ///
     /// This will trigger the build process first. On success all test contracts that match the
@@ -128,17 +231,29 @@ impl TestArgs {
     ///
     /// Returns the test results for all matching tests.
     pub async fn execute_tests(self) -> Result<TestOutcome> {
+        // Set number of max threads to execute tests.
+        // If not specified then the number of threads determined by rayon will be used.
+        if let Some(test_threads) = self.max_threads {
+            trace!(target: "forge::test", "execute tests with {} max threads", test_threads);
+            rayon::ThreadPoolBuilder::new().num_threads(test_threads as usize).build_global()?;
+        }
+
         // Merge all configs
         let (mut config, mut evm_opts) = self.load_config_and_evm_opts_emit_warnings()?;
 
-        let mut filter = self.filter(&config);
+        // Explicitly enable isolation for gas reports for more correct gas accounting
+        if self.gas_report {
+            evm_opts.isolate = true;
+        } else {
+            // Do not collect gas report traces if gas report is not enabled.
+            config.fuzz.gas_report_samples = 0;
+            config.invariant.gas_report_samples = 0;
+        }
 
-        trace!(target: "forge::test", ?filter, "using filter");
-
-        // Set up the project
+        // Set up the project.
         let mut project = config.project()?;
 
-        // install missing dependencies
+        // Install missing dependencies.
         if install::install_missing_dependencies(&mut config, self.build_args().silent) &&
             config.auto_detect_remappings
         {
@@ -147,24 +262,25 @@ impl TestArgs {
             project = config.project()?;
         }
 
-        let compiler = ProjectCompiler::default();
-        let output = if config.sparse_mode {
-            compiler.compile_sparse(&project, filter.clone())
-        } else if self.opts.silent {
-            compile::suppress_compile(&project)
-        } else {
-            compiler.compile(&project)
-        }?;
+        let mut filter = self.filter(&config);
+        trace!(target: "forge::test", ?filter, "using filter");
 
-        // Create test options from general project settings
-        // and compiler output
+        let sources_to_compile = self.get_sources_to_compile(&config, &filter)?;
+
+        let compiler = ProjectCompiler::new()
+            .quiet_if(self.json || self.opts.silent)
+            .files(sources_to_compile);
+
+        let output = compiler.compile(&project)?;
+
+        // Create test options from general project settings and compiler output.
         let project_root = &project.paths.root;
         let toml = config.get_config_path();
         let profiles = get_available_profiles(toml)?;
 
         let test_options: TestOptions = TestOptionsBuilder::default()
-            .fuzz(config.fuzz)
-            .invariant(config.invariant)
+            .fuzz(config.fuzz.clone())
+            .invariant(config.invariant.clone())
             .profiles(profiles)
             .build(&output, project_root)?;
 
@@ -177,87 +293,284 @@ impl TestArgs {
         let env = evm_opts.evm_env().await?;
 
         // Prepare the test builder
-        let evm_spec = evm_spec(config.evm_version);
-
-        let mut runner = MultiContractRunnerBuilder::default()
+        let should_debug = self.debug.is_some();
+        let config = Arc::new(config);
+        let runner = MultiContractRunnerBuilder::new(config.clone())
+            .set_debug(should_debug)
             .initial_balance(evm_opts.initial_balance)
-            .evm_spec(evm_spec)
+            .evm_spec(config.evm_spec_id())
             .sender(evm_opts.sender)
             .with_fork(evm_opts.get_fork(&config, env.clone()))
-            .with_cheats_config(CheatsConfig::new(&config, &evm_opts))
-            .with_test_options(test_options.clone())
-            .build(project_root, output, env, evm_opts)?;
+            .with_test_options(test_options)
+            .enable_isolation(evm_opts.isolate)
+            .build(project_root, &output, env, evm_opts)?;
 
-        if self.debug.is_some() {
-            filter.args_mut().test_pattern = self.debug;
-
-            match runner.count_filtered_tests(&filter) {
-                1 => {
-                    // Run the test
-                    let results = runner.test(&filter, None, test_options).await;
-
-                    // Get the result of the single test
-                    let (id, sig, test_kind, counterexample, breakpoints) = results.iter().map(|(id, SuiteResult{ test_results, .. })| {
-                        let (sig, result) = test_results.iter().next().unwrap();
-
-                        (id.clone(), sig.clone(), result.kind.clone(), result.counterexample.clone(), result.breakpoints.clone())
-                    }).next().unwrap();
-
-                    // Build debugger args if this is a fuzz test
-                    let sig = match test_kind {
-                        TestKind::Fuzz { first_case, .. } => {
-                            if let Some(CounterExample::Single(counterexample)) = counterexample {
-                                counterexample.calldata.to_string()
-                            } else {
-                                first_case.calldata.to_string()
-                            }
-                        },
-                        _ => sig,
-                    };
-
-                    // Run the debugger
-                    let mut opts = self.opts.clone();
-                    opts.silent = true;
-                    let debugger = DebugArgs {
-                        path: PathBuf::from(runner.source_paths.get(&id).unwrap()),
-                        target_contract: Some(get_contract_name(&id).to_string()),
-                        sig,
-                        args: Vec::new(),
-                        debug: true,
-                        opts,
-                        evm_opts: self.evm_opts,
-                    };
-                    debugger.debug(breakpoints).await?;
-
-                    Ok(TestOutcome::new(results, self.allow_failure))
-                }
-                n =>
-                    Err(
-                        eyre::eyre!("{n} tests matched your criteria, but exactly 1 test must match in order to run the debugger.\n
-                        \n
-                        Use --match-contract and --match-path to further limit the search."))
+        if let Some(debug_test_pattern) = &self.debug {
+            let test_pattern = &mut filter.args_mut().test_pattern;
+            if test_pattern.is_some() {
+                eyre::bail!(
+                    "Cannot specify both --debug and --match-test. \
+                     Use --match-contract and --match-path to further limit the search instead."
+                );
             }
-        } else if self.list {
-            list(runner, filter, self.json)
-        } else {
-            test(
-                config,
-                runner,
-                verbosity,
-                filter,
-                self.json,
-                self.allow_failure,
-                test_options,
-                self.gas_report,
-                self.fail_fast,
-            )
-            .await
+            *test_pattern = Some(debug_test_pattern.clone());
         }
+
+        let libraries = runner.libraries.clone();
+        let outcome = self.run_tests(runner, config, verbosity, &filter).await?;
+
+        if should_debug {
+            // Get first non-empty suite result. We will have only one such entry
+            let Some((_, test_result)) = outcome
+                .results
+                .iter()
+                .find(|(_, r)| !r.test_results.is_empty())
+                .map(|(_, r)| (r, r.test_results.values().next().unwrap()))
+            else {
+                return Err(eyre::eyre!("no tests were executed"));
+            };
+
+            let sources =
+                ContractSources::from_project_output(&output, project.root(), Some(&libraries))?;
+
+            // Run the debugger.
+            let mut builder = Debugger::builder()
+                .traces(
+                    test_result.traces.iter().filter(|(t, _)| t.is_execution()).cloned().collect(),
+                )
+                .sources(sources)
+                .breakpoints(test_result.breakpoints.clone());
+            if let Some(decoder) = &outcome.last_run_decoder {
+                builder = builder.decoder(decoder);
+            }
+            let mut debugger = builder.build();
+            debugger.try_run()?;
+        }
+
+        Ok(outcome)
+    }
+
+    /// Run all tests that matches the filter predicate from a test runner
+    pub async fn run_tests(
+        &self,
+        mut runner: MultiContractRunner,
+        config: Arc<Config>,
+        verbosity: u8,
+        filter: &ProjectPathsAwareFilter,
+    ) -> eyre::Result<TestOutcome> {
+        if self.list {
+            return list(runner, filter, self.json);
+        }
+
+        trace!(target: "forge::test", "running all tests");
+
+        let num_filtered = runner.matching_test_functions(filter).count();
+        if self.debug.is_some() && num_filtered != 1 {
+            eyre::bail!(
+                "{num_filtered} tests matched your criteria, but exactly 1 test must match in order to run the debugger.\n\n\
+                 Use --match-contract and --match-path to further limit the search.\n\
+                 Filter used:\n{filter}"
+            );
+        }
+
+        if self.json {
+            let results = runner.test_collect(filter);
+            println!("{}", serde_json::to_string(&results)?);
+            return Ok(TestOutcome::new(results, self.allow_failure));
+        }
+
+        let remote_chain_id = runner.evm_opts.get_remote_chain_id().await;
+        let known_contracts = runner.known_contracts.clone();
+
+        // Run tests.
+        let (tx, rx) = channel::<(String, SuiteResult)>();
+        let timer = Instant::now();
+        let show_progress = self.show_progress;
+        let handle = tokio::task::spawn_blocking({
+            let filter = filter.clone();
+            move || runner.test(&filter, tx, show_progress)
+        });
+
+        // Set up trace identifiers.
+        let mut identifier = TraceIdentifiers::new().with_local(&known_contracts);
+
+        // Avoid using etherscan for gas report as we decode more traces and this will be
+        // expensive.
+        if !self.gas_report {
+            identifier = identifier.with_etherscan(&config, remote_chain_id)?;
+        }
+
+        // Build the trace decoder.
+        let mut builder = CallTraceDecoderBuilder::new()
+            .with_known_contracts(&known_contracts)
+            .with_verbosity(verbosity);
+        // Signatures are of no value for gas reports.
+        if !self.gas_report {
+            builder = builder.with_signature_identifier(SignaturesIdentifier::new(
+                Config::foundry_cache_dir(),
+                config.offline,
+            )?);
+        }
+        let mut decoder = builder.build();
+
+        let mut gas_report = self
+            .gas_report
+            .then(|| GasReport::new(config.gas_reports.clone(), config.gas_reports_ignore.clone()));
+
+        let mut outcome = TestOutcome::empty(self.allow_failure);
+
+        let mut any_test_failed = false;
+        for (contract_name, suite_result) in rx {
+            let tests = &suite_result.test_results;
+
+            // Clear the addresses and labels from previous test.
+            decoder.clear_addresses();
+
+            // We identify addresses if we're going to print *any* trace or gas report.
+            let identify_addresses = verbosity >= 3 || self.gas_report || self.debug.is_some();
+
+            // Print suite header.
+            println!();
+            for warning in suite_result.warnings.iter() {
+                eprintln!("{} {warning}", "Warning:".yellow().bold());
+            }
+            if !tests.is_empty() {
+                let len = tests.len();
+                let tests = if len > 1 { "tests" } else { "test" };
+                println!("Ran {len} {tests} for {contract_name}");
+            }
+
+            // Process individual test results, printing logs and traces when necessary.
+            for (name, result) in tests {
+                shell::println(result.short_result(name))?;
+
+                // We only display logs at level 2 and above
+                if verbosity >= 2 {
+                    // We only decode logs from Hardhat and DS-style console events
+                    let console_logs = decode_console_logs(&result.logs);
+                    if !console_logs.is_empty() {
+                        println!("Logs:");
+                        for log in console_logs {
+                            println!("  {log}");
+                        }
+                        println!();
+                    }
+                }
+
+                // We shouldn't break out of the outer loop directly here so that we finish
+                // processing the remaining tests and print the suite summary.
+                any_test_failed |= result.status == TestStatus::Failure;
+
+                // Clear the addresses and labels from previous runs.
+                decoder.clear_addresses();
+                decoder
+                    .labels
+                    .extend(result.labeled_addresses.iter().map(|(k, v)| (*k, v.clone())));
+
+                // Identify addresses and decode traces.
+                let mut decoded_traces = Vec::with_capacity(result.traces.len());
+                for (kind, arena) in &result.traces {
+                    if identify_addresses {
+                        decoder.identify(arena, &mut identifier);
+                    }
+
+                    // verbosity:
+                    // - 0..3: nothing
+                    // - 3: only display traces for failed tests
+                    // - 4: also display the setup trace for failed tests
+                    // - 5..: display all traces for all tests
+                    let should_include = match kind {
+                        TraceKind::Execution => {
+                            (verbosity == 3 && result.status.is_failure()) || verbosity >= 4
+                        }
+                        TraceKind::Setup => {
+                            (verbosity == 4 && result.status.is_failure()) || verbosity >= 5
+                        }
+                        TraceKind::Deployment => false,
+                    };
+
+                    if should_include {
+                        decoded_traces.push(render_trace_arena(arena, &decoder).await?);
+                    }
+                }
+
+                if !decoded_traces.is_empty() {
+                    shell::println("Traces:")?;
+                    for trace in &decoded_traces {
+                        shell::println(trace)?;
+                    }
+                }
+
+                if let Some(gas_report) = &mut gas_report {
+                    gas_report
+                        .analyze(result.traces.iter().map(|(_, arena)| arena), &decoder)
+                        .await;
+
+                    for trace in result.gas_report_traces.iter() {
+                        decoder.clear_addresses();
+
+                        // Re-execute setup and deployment traces to collect identities created in
+                        // setUp and constructor.
+                        for (kind, arena) in &result.traces {
+                            if !matches!(kind, TraceKind::Execution) {
+                                decoder.identify(arena, &mut identifier);
+                            }
+                        }
+
+                        for arena in trace {
+                            decoder.identify(arena, &mut identifier);
+                            gas_report.analyze([arena], &decoder).await;
+                        }
+                    }
+                }
+            }
+
+            // Print suite summary.
+            shell::println(suite_result.summary())?;
+
+            // Add the suite result to the outcome.
+            outcome.results.insert(contract_name, suite_result);
+
+            // Stop processing the remaining suites if any test failed and `fail_fast` is set.
+            if self.fail_fast && any_test_failed {
+                break;
+            }
+        }
+        outcome.last_run_decoder = Some(decoder);
+        let duration = timer.elapsed();
+
+        trace!(target: "forge::test", len=outcome.results.len(), %any_test_failed, "done with results");
+
+        if let Some(gas_report) = gas_report {
+            let finalized = gas_report.finalize();
+            shell::println(&finalized)?;
+            outcome.gas_report = Some(finalized);
+        }
+
+        if !outcome.results.is_empty() {
+            shell::println(outcome.summary(duration))?;
+
+            if self.summary {
+                let mut summary_table = TestSummaryReporter::new(self.detailed);
+                shell::println("\n\nTest Summary:")?;
+                summary_table.print_summary(&outcome);
+            }
+        }
+
+        // Reattach the task.
+        if let Err(e) = handle.await {
+            match e.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(outcome)
     }
 
     /// Returns the flattened [`FilterArgs`] arguments merged with [`Config`].
     pub fn filter(&self, config: &Config) -> ProjectPathsAwareFilter {
-        self.filter.merge_with_config(config)
+        self.filter.clone().merge_with_config(config)
     }
 
     /// Returns whether `BuildArgs` was configured with `--watch`
@@ -290,9 +603,14 @@ impl Provider for TestArgs {
         if let Some(fuzz_runs) = self.fuzz_runs {
             fuzz_dict.insert("runs".to_string(), fuzz_runs.into());
         }
+        if let Some(fuzz_input_file) = self.fuzz_input_file.clone() {
+            fuzz_dict.insert("failure_persist_file".to_string(), fuzz_input_file.into());
+        }
         dict.insert("fuzz".to_string(), fuzz_dict.into());
 
-        if let Some(ref etherscan_api_key) = self.etherscan_api_key {
+        if let Some(etherscan_api_key) =
+            self.etherscan_api_key.as_ref().filter(|s| !s.trim().is_empty())
+        {
             dict.insert("etherscan_api_key".to_string(), etherscan_api_key.to_string().into());
         }
 
@@ -300,194 +618,13 @@ impl Provider for TestArgs {
     }
 }
 
-/// The result of a single test
-#[derive(Debug, Clone)]
-pub struct Test {
-    /// The identifier of the artifact/contract in the form of `<artifact file name>:<contract
-    /// name>`
-    pub artifact_id: String,
-    /// The signature of the solidity test
-    pub signature: String,
-    /// Result of the executed solidity test
-    pub result: TestResult,
-}
-
-impl Test {
-    pub fn gas_used(&self) -> u64 {
-        self.result.kind.report().gas()
-    }
-
-    /// Returns the contract name of the artifact id
-    pub fn contract_name(&self) -> &str {
-        get_contract_name(&self.artifact_id)
-    }
-
-    /// Returns the file name of the artifact id
-    pub fn file_name(&self) -> &str {
-        get_file_name(&self.artifact_id)
-    }
-}
-
-/// Represents the bundled results of all tests
-pub struct TestOutcome {
-    /// Whether failures are allowed
-    pub allow_failure: bool,
-    /// Results for each suite of tests `contract -> SuiteResult`
-    pub results: BTreeMap<String, SuiteResult>,
-}
-
-impl TestOutcome {
-    fn new(results: BTreeMap<String, SuiteResult>, allow_failure: bool) -> Self {
-        Self { results, allow_failure }
-    }
-
-    /// Iterator over all succeeding tests and their names
-    pub fn successes(&self) -> impl Iterator<Item = (&String, &TestResult)> {
-        self.tests().filter(|(_, t)| t.status == TestStatus::Success)
-    }
-
-    /// Iterator over all failing tests and their names
-    pub fn failures(&self) -> impl Iterator<Item = (&String, &TestResult)> {
-        self.tests().filter(|(_, t)| t.status == TestStatus::Failure)
-    }
-
-    pub fn skips(&self) -> impl Iterator<Item = (&String, &TestResult)> {
-        self.tests().filter(|(_, t)| t.status == TestStatus::Skipped)
-    }
-
-    /// Iterator over all tests and their names
-    pub fn tests(&self) -> impl Iterator<Item = (&String, &TestResult)> {
-        self.results.values().flat_map(|suite| suite.tests())
-    }
-
-    /// Returns an iterator over all `Test`
-    pub fn into_tests(self) -> impl Iterator<Item = Test> {
-        self.results
-            .into_iter()
-            .flat_map(|(file, SuiteResult { test_results, .. })| {
-                test_results.into_iter().map(move |t| (file.clone(), t))
-            })
-            .map(|(artifact_id, (signature, result))| Test { artifact_id, signature, result })
-    }
-
-    /// Checks if there are any failures and failures are disallowed
-    pub fn ensure_ok(&self) -> Result<()> {
-        let failures = self.failures().count();
-        if self.allow_failure || failures == 0 {
-            return Ok(())
-        }
-
-        if !shell::verbosity().is_normal() {
-            // skip printing and exit early
-            std::process::exit(1);
-        }
-
-        println!();
-        println!("Failing tests:");
-        for (suite_name, suite) in self.results.iter() {
-            let failures = suite.failures().count();
-            if failures == 0 {
-                continue
-            }
-
-            let term = if failures > 1 { "tests" } else { "test" };
-            println!("Encountered {failures} failing {term} in {suite_name}");
-            for (name, result) in suite.failures() {
-                short_test_result(name, result);
-            }
-            println!();
-        }
-        let successes = self.successes().count();
-        println!(
-            "Encountered a total of {} failing tests, {} tests succeeded",
-            Paint::red(failures.to_string()),
-            Paint::green(successes.to_string())
-        );
-
-        std::process::exit(1);
-    }
-
-    pub fn duration(&self) -> Duration {
-        self.results
-            .values()
-            .fold(Duration::ZERO, |acc, SuiteResult { duration, .. }| acc + *duration)
-    }
-
-    pub fn summary(&self) -> String {
-        let failed = self.failures().count();
-        let result = if failed == 0 { Paint::green("ok") } else { Paint::red("FAILED") };
-        format!(
-            "Test result: {}. {} passed; {} failed; {} skipped; finished in {:.2?}",
-            result,
-            Paint::green(self.successes().count()),
-            Paint::red(failed),
-            Paint::yellow(self.skips().count()),
-            self.duration()
-        )
-    }
-}
-
-fn short_test_result(name: &str, result: &TestResult) {
-    let status = if result.status == TestStatus::Success {
-        Paint::green("[PASS]".to_string())
-    } else if result.status == TestStatus::Skipped {
-        Paint::yellow("[SKIP]".to_string())
-    } else {
-        let reason = result
-            .reason
-            .as_ref()
-            .map(|reason| format!("Reason: {reason}"))
-            .unwrap_or_else(|| "Reason: Assertion failed.".to_string());
-
-        let counterexample = result
-            .counterexample
-            .as_ref()
-            .map(|example| match example {
-                CounterExample::Single(eg) => format!(" Counterexample: {eg}]"),
-                CounterExample::Sequence(sequence) => {
-                    let mut inner_txt = String::new();
-
-                    for checkpoint in sequence {
-                        inner_txt += format!("\t\t{checkpoint}\n").as_str();
-                    }
-                    format!("]\n\t[Sequence]\n{inner_txt}\n")
-                }
-            })
-            .unwrap_or_else(|| "]".to_string());
-
-        Paint::red(format!("[FAIL. {reason}{counterexample}"))
-    };
-
-    println!("{status} {name} {}", result.kind.report());
-}
-
-/**
- * Formats the aggregated summary of all test suites into a string (for printing)
- */
-fn format_aggregated_summary(
-    num_test_suites: usize,
-    total_passed: usize,
-    total_failed: usize,
-    total_skipped: usize,
-) -> String {
-    let total_tests = total_passed + total_failed + total_skipped;
-    format!(
-        " \nRan {} test suites: {} tests passed, {} failed, {} skipped ({} total tests)",
-        num_test_suites,
-        Paint::green(total_passed),
-        Paint::red(total_failed),
-        Paint::yellow(total_skipped),
-        total_tests
-    )
-}
-
 /// Lists all matching tests
 fn list(
     runner: MultiContractRunner,
-    filter: ProjectPathsAwareFilter,
+    filter: &ProjectPathsAwareFilter,
     json: bool,
 ) -> Result<TestOutcome> {
-    let results = runner.list(&filter);
+    let results = runner.list(filter);
 
     if json {
         println!("{}", serde_json::to_string(&results)?);
@@ -500,186 +637,110 @@ fn list(
             }
         }
     }
-    Ok(TestOutcome::new(BTreeMap::new(), false))
+    Ok(TestOutcome::empty(false))
 }
 
-/// Runs all the tests
-#[allow(clippy::too_many_arguments)]
-async fn test(
-    config: Config,
-    mut runner: MultiContractRunner,
-    verbosity: u8,
-    filter: ProjectPathsAwareFilter,
-    json: bool,
-    allow_failure: bool,
-    test_options: TestOptions,
-    gas_reporting: bool,
-    fail_fast: bool,
-) -> Result<TestOutcome> {
-    trace!(target: "forge::test", "running all tests");
-    if runner.count_filtered_tests(&filter) == 0 {
-        let filter_str = filter.to_string();
-        if filter_str.is_empty() {
-            println!(
-                "\nNo tests found in project! Forge looks for functions that starts with `test`."
-            );
-        } else {
-            println!("\nNo tests match the provided pattern:");
-            println!("{filter_str}");
-            // Try to suggest a test when there's no match
-            if let Some(ref test_pattern) = filter.args().test_pattern {
-                let test_name = test_pattern.as_str();
-                let candidates = runner.get_tests(&filter);
-                if let Some(suggestion) = utils::did_you_mean(test_name, candidates).pop() {
-                    println!("\nDid you mean `{suggestion}`?");
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foundry_config::{Chain, InvariantConfig};
+    use foundry_test_utils::forgetest_async;
+
+    #[test]
+    fn watch_parse() {
+        let args: TestArgs = TestArgs::parse_from(["foundry-cli", "-vw"]);
+        assert!(args.watch.watch.is_some());
     }
 
-    if json {
-        let results = runner.test(filter, None, test_options).await;
-        println!("{}", serde_json::to_string(&results)?);
-        return Ok(TestOutcome::new(results, allow_failure))
+    #[test]
+    fn fuzz_seed() {
+        let args: TestArgs = TestArgs::parse_from(["foundry-cli", "--fuzz-seed", "0x10"]);
+        assert!(args.fuzz_seed.is_some());
     }
 
-    // Set up identifiers
-    let known_contracts = runner.known_contracts.clone();
-    let mut local_identifier = LocalTraceIdentifier::new(&known_contracts);
-    let remote_chain_id = runner.evm_opts.get_remote_chain_id();
-    // Do not re-query etherscan for contracts that you've already queried today.
-    let mut etherscan_identifier = EtherscanIdentifier::new(&config, remote_chain_id)?;
-
-    // Set up test reporter channel
-    let (tx, rx) = channel::<(String, SuiteResult)>();
-
-    // Run tests
-    let handle =
-        tokio::task::spawn(async move { runner.test(filter, Some(tx), test_options).await });
-
-    let mut results: BTreeMap<String, SuiteResult> = BTreeMap::new();
-    let mut gas_report = GasReport::new(config.gas_reports, config.gas_reports_ignore);
-    let sig_identifier = SignaturesIdentifier::new(Config::foundry_cache_dir(), config.offline)?;
-
-    let mut total_passed = 0;
-    let mut total_failed = 0;
-    let mut total_skipped = 0;
-
-    'outer: for (contract_name, suite_result) in rx {
-        results.insert(contract_name.clone(), suite_result.clone());
-
-        let mut tests = suite_result.test_results.clone();
-        println!();
-        for warning in suite_result.warnings.iter() {
-            eprintln!("{} {warning}", Paint::yellow("Warning:").bold());
-        }
-        if !tests.is_empty() {
-            let term = if tests.len() > 1 { "tests" } else { "test" };
-            println!("Running {} {term} for {contract_name}", tests.len());
-        }
-        for (name, result) in &mut tests {
-            short_test_result(name, result);
-
-            // If the test failed, we want to stop processing the rest of the tests
-            if fail_fast && result.status == TestStatus::Failure {
-                break 'outer
-            }
-
-            // We only display logs at level 2 and above
-            if verbosity >= 2 {
-                // We only decode logs from Hardhat and DS-style console events
-                let console_logs = decode_console_logs(&result.logs);
-                if !console_logs.is_empty() {
-                    println!("Logs:");
-                    for log in console_logs {
-                        println!("  {log}");
-                    }
-                    println!();
-                }
-            }
-
-            if result.traces.is_empty() {
-                continue
-            }
-
-            // Identify addresses in each trace
-            let mut builder = CallTraceDecoderBuilder::new()
-                .with_labels(result.labeled_addresses.iter().map(|(a, s)| (*a, s.clone())))
-                .with_events(local_identifier.events().cloned())
-                .with_verbosity(verbosity);
-
-            // Signatures are of no value for gas reports
-            if !gas_reporting {
-                builder = builder.with_signature_identifier(sig_identifier.clone());
-            }
-
-            let mut decoder = builder.build();
-
-            // Decode the traces
-            let mut decoded_traces = Vec::with_capacity(result.traces.len());
-            for (kind, trace) in &mut result.traces {
-                decoder.identify(trace, &mut local_identifier);
-                decoder.identify(trace, &mut etherscan_identifier);
-
-                // verbosity:
-                // - 0..3: nothing
-                // - 3: only display traces for failed tests
-                // - 4: also display the setup trace for failed tests
-                // - 5..: display all traces for all tests
-                let should_include = match kind {
-                    TraceKind::Execution => {
-                        (verbosity == 3 && result.status.is_failure()) || verbosity >= 4
-                    }
-                    TraceKind::Setup => {
-                        (verbosity == 4 && result.status.is_failure()) || verbosity >= 5
-                    }
-                    TraceKind::Deployment => false,
-                };
-
-                // Decode the trace if we either need to build a gas report or we need to print it
-                if should_include || gas_reporting {
-                    decoder.decode(trace).await;
-                }
-
-                if should_include {
-                    decoded_traces.push(trace.to_string());
-                }
-            }
-
-            if !decoded_traces.is_empty() {
-                println!("Traces:");
-                decoded_traces.into_iter().for_each(|trace| println!("{trace}"));
-            }
-
-            if gas_reporting {
-                gas_report.analyze(&result.traces);
-            }
-        }
-        let block_outcome = TestOutcome::new([(contract_name, suite_result)].into(), allow_failure);
-
-        total_passed += block_outcome.successes().count();
-        total_failed += block_outcome.failures().count();
-        total_skipped += block_outcome.skips().count();
-
-        println!("{}", block_outcome.summary());
+    // <https://github.com/foundry-rs/foundry/issues/5913>
+    #[test]
+    fn fuzz_seed_exists() {
+        let args: TestArgs =
+            TestArgs::parse_from(["foundry-cli", "-vvv", "--gas-report", "--fuzz-seed", "0x10"]);
+        assert!(args.fuzz_seed.is_some());
     }
 
-    if gas_reporting {
-        println!("{}", gas_report.finalize());
+    #[test]
+    fn extract_chain() {
+        let test = |arg: &str, expected: Chain| {
+            let args = TestArgs::parse_from(["foundry-cli", arg]);
+            assert_eq!(args.evm_opts.env.chain, Some(expected));
+            let (config, evm_opts) = args.load_config_and_evm_opts().unwrap();
+            assert_eq!(config.chain, Some(expected));
+            assert_eq!(evm_opts.env.chain_id, Some(expected.id()));
+        };
+        test("--chain-id=1", Chain::mainnet());
+        test("--chain-id=42", Chain::from_id(42));
     }
 
-    let num_test_suites = results.len();
+    forgetest_async!(gas_report_fuzz_invariant, |prj, _cmd| {
+        // speed up test by running with depth of 15
+        let config = Config {
+            invariant: { InvariantConfig { depth: 15, ..Default::default() } },
+            ..Default::default()
+        };
+        prj.write_config(config);
 
-    if num_test_suites > 0 {
-        println!(
-            "{}",
-            format_aggregated_summary(num_test_suites, total_passed, total_failed, total_skipped)
-        );
+        prj.insert_ds_test();
+        prj.add_source(
+            "Contracts.sol",
+            r#"
+//SPDX-license-identifier: MIT
+
+import "./test.sol";
+
+contract Foo {
+    function foo() public {}
+}
+
+contract Bar {
+    function bar() public {}
+}
+
+
+contract FooBarTest is DSTest {
+    Foo public targetContract;
+
+    function setUp() public {
+        targetContract = new Foo();
     }
 
-    // reattach the thread
-    let _results = handle.await?;
+    function invariant_dummy() public {
+        assertTrue(true);
+    }
 
-    trace!(target: "forge::test", "received {} results", results.len());
-    Ok(TestOutcome::new(results, allow_failure))
+    function testFuzz_bar(uint256 _val) public {
+        (new Bar()).bar();
+    }
+}
+        "#,
+        )
+        .unwrap();
+
+        let args = TestArgs::parse_from([
+            "foundry-cli",
+            "--gas-report",
+            "--root",
+            &prj.root().to_string_lossy(),
+            "--silent",
+        ]);
+
+        let outcome = args.run().await.unwrap();
+        let gas_report = outcome.gas_report.unwrap();
+
+        assert_eq!(gas_report.contracts.len(), 3);
+        let call_cnts = gas_report
+            .contracts
+            .values()
+            .flat_map(|c| c.functions.values().flat_map(|f| f.values().map(|v| v.calls.len())))
+            .collect::<Vec<_>>();
+        // assert that all functions were called at least 100 times
+        assert!(call_cnts.iter().all(|c| *c > 100));
+    });
 }

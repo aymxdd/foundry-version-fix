@@ -1,4 +1,4 @@
-use forge_fmt::{format, parse, solang_ext::AstEq, FormatterConfig};
+use forge_fmt::{format_to, parse, solang_ext::AstEq, FormatterConfig};
 use itertools::Itertools;
 use std::{fs, path::PathBuf};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -11,7 +11,7 @@ fn tracing() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-fn test_directory(base_name: &str) {
+fn test_directory(base_name: &str, test_config: TestConfig) {
     tracing();
     let mut original = None;
 
@@ -36,7 +36,7 @@ fn test_directory(base_name: &str) {
                         let default_config =
                             FormatterConfig { line_length: 80, ..Default::default() };
 
-                        let mut config = toml::Value::try_from(&default_config).unwrap();
+                        let mut config = toml::Value::try_from(default_config).unwrap();
                         let config_table = config.as_table_mut().unwrap();
                         let mut lines = source.split('\n').peekable();
                         let mut line_num = 1;
@@ -74,6 +74,7 @@ fn test_directory(base_name: &str) {
             config,
             original.as_ref().expect("original.sol not found"),
             &formatted,
+            test_config,
         );
     }
 }
@@ -82,18 +83,24 @@ fn assert_eof(content: &str) {
     assert!(content.ends_with('\n') && !content.ends_with("\n\n"));
 }
 
-fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expected_source: &str) {
+fn test_formatter(
+    filename: &str,
+    config: FormatterConfig,
+    source: &str,
+    expected_source: &str,
+    test_config: TestConfig,
+) {
     #[derive(Eq)]
     struct PrettyString(String);
 
     impl PartialEq for PrettyString {
-        fn eq(&self, other: &PrettyString) -> bool {
+        fn eq(&self, other: &Self) -> bool {
             self.0.lines().eq(other.0.lines())
         }
     }
 
     impl std::fmt::Debug for PrettyString {
-        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(&self.0)
         }
     }
@@ -103,8 +110,8 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
     let source_parsed = parse(source).unwrap();
     let expected_parsed = parse(expected_source).unwrap();
 
-    if !source_parsed.pt.ast_eq(&expected_parsed.pt) {
-        pretty_assertions::assert_eq!(
+    if !test_config.skip_compare_ast_eq && !source_parsed.pt.ast_eq(&expected_parsed.pt) {
+        similar_asserts::assert_eq!(
             source_parsed.pt,
             expected_parsed.pt,
             "(formatted Parse Tree == expected Parse Tree) in {}",
@@ -115,13 +122,12 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
     let expected = PrettyString(expected_source.to_string());
 
     let mut source_formatted = String::new();
-    format(&mut source_formatted, source_parsed, config.clone()).unwrap();
+    format_to(&mut source_formatted, source_parsed, config.clone()).unwrap();
     assert_eof(&source_formatted);
 
-    // println!("{}", source_formatted);
     let source_formatted = PrettyString(source_formatted);
 
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         source_formatted,
         expected,
         "(formatted == expected) in {}",
@@ -129,12 +135,12 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
     );
 
     let mut expected_formatted = String::new();
-    format(&mut expected_formatted, expected_parsed, config).unwrap();
+    format_to(&mut expected_formatted, expected_parsed, config).unwrap();
     assert_eof(&expected_formatted);
 
     let expected_formatted = PrettyString(expected_formatted);
 
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         expected_formatted,
         expected,
         "(formatted == expected) in {}",
@@ -142,24 +148,47 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
     );
 }
 
-macro_rules! test_directories {
-    ($($dir:ident),+ $(,)?) => {$(
+#[derive(Clone, Copy, Default)]
+struct TestConfig {
+    /// Whether to compare the formatted source code AST with the original AST
+    skip_compare_ast_eq: bool,
+}
+
+impl TestConfig {
+    fn skip_compare_ast_eq() -> Self {
+        Self { skip_compare_ast_eq: true }
+    }
+}
+
+macro_rules! test_dir {
+    ($dir:ident $(,)?) => {
+        test_dir!($dir, Default::default());
+    };
+    ($dir:ident, $config:expr $(,)?) => {
         #[allow(non_snake_case)]
         #[test]
         fn $dir() {
-            test_directory(stringify!($dir));
+            test_directory(stringify!($dir), $config);
         }
+    };
+}
+
+macro_rules! test_directories {
+    ($($dir:ident),+ $(,)?) => {$(
+        test_dir!($dir);
     )+};
 }
 
 test_directories! {
     ConstructorDefinition,
+    ConstructorModifierStyle,
     ContractDefinition,
     DocComments,
     EnumDefinition,
     ErrorDefinition,
     EventDefinition,
     FunctionDefinition,
+    FunctionDefinitionWithFunctionReturns,
     FunctionType,
     ImportDirective,
     ModifierDefinition,
@@ -192,6 +221,7 @@ test_directories! {
     IntTypes,
     InlineDisable,
     NumberLiteralUnderscore,
+    HexUnderscore,
     FunctionCall,
     TrailingComma,
     PragmaDirective,
@@ -199,4 +229,9 @@ test_directories! {
     MappingType,
     EmitStatement,
     Repros,
+    BlockComments,
+    BlockCommentsFunction,
+    EnumVariants,
 }
+
+test_dir!(SortedImports, TestConfig::skip_compare_ast_eq());

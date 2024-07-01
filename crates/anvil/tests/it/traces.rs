@@ -1,36 +1,41 @@
-use crate::fork::fork_config;
-use anvil::{spawn, NodeConfig};
-use ethers::{
-    contract::ContractInstance,
-    prelude::{
-        Action, ContractFactory, GethTrace, GethTraceFrame, Middleware, Signer, SignerMiddleware,
-        TransactionRequest,
-    },
-    types::{ActionType, Address, GethDebugTracingCallOptions, Trace},
-    utils::hex,
+use crate::{fork::fork_config, utils::http_provider_with_signer};
+use alloy_network::{EthereumWallet, TransactionBuilder};
+use alloy_primitives::{hex, Address, Bytes, U256};
+use alloy_provider::{
+    ext::{DebugApi, TraceApi},
+    Provider,
 };
-use ethers_solc::{project_util::TempProject, Artifact};
-use std::sync::Arc;
+use alloy_rpc_types::{
+    trace::{
+        geth::{GethDebugTracingCallOptions, GethTrace},
+        parity::{Action, LocalizedTransactionTrace},
+    },
+    BlockNumberOrTag, TransactionRequest,
+};
+use alloy_serde::WithOtherFields;
+use alloy_sol_types::sol;
+use anvil::{spawn, Hardfork, NodeConfig};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_transfer_parity_traces() {
     let (_api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = handle.ws_provider();
 
-    let accounts: Vec<_> = handle.dev_wallets().collect();
+    let accounts = handle.dev_wallets().collect::<Vec<_>>();
     let from = accounts[0].address();
     let to = accounts[1].address();
-    let amount = handle.genesis_balance().checked_div(2u64.into()).unwrap();
+    let amount = handle.genesis_balance().checked_div(U256::from(2u64)).unwrap();
     // specify the `from` field so that the client knows which account to use
-    let tx = TransactionRequest::new().to(to).value(amount).from(from);
+    let tx = TransactionRequest::default().to(to).value(amount).from(from);
+    let tx = WithOtherFields::new(tx);
 
     // broadcast it via the eth_sendTransaction API
-    let tx = provider.send_transaction(tx, None).await.unwrap().await.unwrap().unwrap();
+    let tx = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
     let traces = provider.trace_transaction(tx.transaction_hash).await.unwrap();
     assert!(!traces.is_empty());
 
-    match traces[0].action {
+    match traces[0].trace.action {
         Action::Call(ref call) => {
             assert_eq!(call.from, from);
             assert_eq!(call.to, to);
@@ -46,109 +51,88 @@ async fn test_get_transfer_parity_traces() {
     assert_eq!(traces, block_traces);
 }
 
+sol!(
+    #[sol(rpc, bytecode = "0x6080604052348015600f57600080fd5b50336000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555060a48061005e6000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c806375fc8e3c14602d575b600080fd5b60336035565b005b60008054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16fffea26469706673582212205006867290df97c54f2df1cb94fc081197ab670e2adf5353071d2ecce1d694b864736f6c634300080d0033")]
+    contract SuicideContract {
+        address payable private owner;
+        constructor() public {
+            owner = payable(msg.sender);
+        }
+        function goodbye() public {
+            selfdestruct(owner);
+        }
+    }
+);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parity_suicide_trace() {
-    let prj = TempProject::dapptools().unwrap();
-    prj.add_source(
-        "Contract",
-        r#"
-pragma solidity 0.8.13;
-contract Contract {
-    address payable private owner;
-    constructor() public {
-        owner = payable(msg.sender);
-    }
-    function goodbye() public {
-        selfdestruct(owner);
-    }
-}
-"#,
-    )
-    .unwrap();
-
-    let mut compiled = prj.compile().unwrap();
-    assert!(!compiled.has_compiler_errors());
-    let contract = compiled.remove_first("Contract").unwrap();
-    let (abi, bytecode, _) = contract.into_contract_bytecode().into_parts();
-
-    let (_api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.ws_provider().await;
+    let (_api, handle) = spawn(NodeConfig::test().with_hardfork(Some(Hardfork::Shanghai))).await;
+    let provider = handle.ws_provider();
     let wallets = handle.dev_wallets().collect::<Vec<_>>();
-    let client = Arc::new(SignerMiddleware::new(provider, wallets[0].clone()));
+    let owner = wallets[0].address();
+    let destructor = wallets[1].address();
 
-    // deploy successfully
-    let factory = ContractFactory::new(abi.clone().unwrap(), bytecode.unwrap(), client);
-    let contract = factory.deploy(()).unwrap().send().await.unwrap();
-
-    let contract = ContractInstance::new(
-        contract.address(),
-        abi.unwrap(),
-        SignerMiddleware::new(handle.http_provider(), wallets[1].clone()),
-    );
-    let call = contract.method::<_, ()>("goodbye", ()).unwrap();
-    let tx = call.send().await.unwrap().await.unwrap().unwrap();
+    let contract_addr =
+        SuicideContract::deploy_builder(provider.clone()).from(owner).deploy().await.unwrap();
+    let contract = SuicideContract::new(contract_addr, provider.clone());
+    let call = contract.goodbye().from(destructor);
+    let call = call.send().await.unwrap();
+    let tx = call.get_receipt().await.unwrap();
 
     let traces = handle.http_provider().trace_transaction(tx.transaction_hash).await.unwrap();
     assert!(!traces.is_empty());
-    assert_eq!(traces[0].action_type, ActionType::Suicide);
+    assert!(traces[1].trace.action.is_selfdestruct());
 }
+
+sol!(
+    #[sol(rpc, bytecode = "0x6080604052348015600f57600080fd5b50336000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555060a48061005e6000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c806375fc8e3c14602d575b600080fd5b60336035565b005b60008054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16fffea26469706673582212205006867290df97c54f2df1cb94fc081197ab670e2adf5353071d2ecce1d694b864736f6c634300080d0033")]
+    contract DebugTraceContract {
+        address payable private owner;
+        constructor() public {
+            owner = payable(msg.sender);
+        }
+        function goodbye() public {
+            selfdestruct(owner);
+        }
+    }
+);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_transfer_debug_trace_call() {
-    let prj = TempProject::dapptools().unwrap();
-    prj.add_source(
-        "Contract",
-        r#"
-pragma solidity 0.8.13;
-contract Contract {
-    address payable private owner;
-    constructor() public {
-        owner = payable(msg.sender);
-    }
-    function goodbye() public {
-        selfdestruct(owner);
-    }
-}
-"#,
-    )
-    .unwrap();
-
-    let mut compiled = prj.compile().unwrap();
-    assert!(!compiled.has_compiler_errors());
-    let contract = compiled.remove_first("Contract").unwrap();
-    let (abi, bytecode, _) = contract.into_contract_bytecode().into_parts();
-
     let (_api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.ws_provider().await;
     let wallets = handle.dev_wallets().collect::<Vec<_>>();
-    let client = Arc::new(SignerMiddleware::new(provider, wallets[0].clone()));
+    let deployer: EthereumWallet = wallets[0].clone().into();
+    let provider = http_provider_with_signer(&handle.http_endpoint(), deployer);
 
-    // deploy successfully
-    let factory = ContractFactory::new(abi.clone().unwrap(), bytecode.unwrap(), client);
-    let contract = factory.deploy(()).unwrap().send().await.unwrap();
+    let contract_addr = DebugTraceContract::deploy_builder(provider.clone())
+        .from(wallets[0].clone().address())
+        .deploy()
+        .await
+        .unwrap();
 
-    let contract = ContractInstance::new(
-        contract.address(),
-        abi.unwrap(),
-        SignerMiddleware::new(handle.http_provider(), wallets[1].clone()),
-    );
-    let call = contract.method::<_, ()>("goodbye", ()).unwrap();
+    let caller: EthereumWallet = wallets[1].clone().into();
+    let caller_provider = http_provider_with_signer(&handle.http_endpoint(), caller);
+    let contract = DebugTraceContract::new(contract_addr, caller_provider);
+
+    let call = contract.goodbye().from(wallets[1].address());
+    let calldata = call.calldata().to_owned();
+
+    let tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*contract.address())
+        .with_input(calldata);
 
     let traces = handle
         .http_provider()
-        .debug_trace_call(call.tx, None, GethDebugTracingCallOptions::default())
+        .debug_trace_call(tx, BlockNumberOrTag::Latest, GethDebugTracingCallOptions::default())
         .await
         .unwrap();
+
     match traces {
-        GethTrace::Known(traces) => match traces {
-            GethTraceFrame::Default(traces) => {
-                assert!(!traces.failed);
-            }
-            _ => {
-                unreachable!()
-            }
-        },
-        GethTrace::Unknown(_) => {
+        GethTrace::Default(default_frame) => {
+            assert!(!default_frame.failed);
+        }
+        _ => {
             unreachable!()
         }
     }
@@ -164,15 +148,20 @@ async fn test_trace_address_fork() {
 
     let from: Address = "0x2e4777139254ff76db957e284b186a4507ff8c67".parse().unwrap();
     let to: Address = "0xe2f2a5c287993345a840db3b0845fbc70f5935a5".parse().unwrap();
-    let tx = TransactionRequest::new().to(to).from(from).data(input).gas(300_000);
+    let tx = TransactionRequest::default()
+        .to(to)
+        .from(from)
+        .with_input::<Bytes>(input.into())
+        .with_gas_limit(300_000);
 
+    let tx = WithOtherFields::new(tx);
     api.anvil_impersonate_account(from).await.unwrap();
 
-    let tx = provider.send_transaction(tx, None).await.unwrap().await.unwrap().unwrap();
+    let tx = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
     let traces = provider.trace_transaction(tx.transaction_hash).await.unwrap();
     assert!(!traces.is_empty());
-    match traces[0].action {
+    match traces[0].trace.action {
         Action::Call(ref call) => {
             assert_eq!(call.from, from);
             assert_eq!(call.to, to);
@@ -180,8 +169,7 @@ async fn test_trace_address_fork() {
         _ => unreachable!("unexpected action"),
     }
 
-    let json = serde_json::json!(
-        [
+    let json = serde_json::json!([
         {
             "action": {
                 "callType": "call",
@@ -219,9 +207,7 @@ async fn test_trace_address_fork() {
                 "output": "0x0000000000000000000000000000000000000000000000e0e82ca52ec6e6a4d3"
             },
             "subtraces": 2,
-            "traceAddress": [
-                0
-            ],
+            "traceAddress": [0],
             "transactionHash": "0x3255cce7312e9c4470e1a1883be13718e971f6faafb96199b8bd75e5b7c39e3a",
             "transactionPosition": 19,
             "type": "call"
@@ -242,10 +228,7 @@ async fn test_trace_address_fork() {
                 "output": "0x0000000000000000000000000000000000000000000000e0e82ca52ec6e6a4d3"
             },
             "subtraces": 0,
-            "traceAddress": [
-                0,
-                0
-            ],
+            "traceAddress": [0, 0],
             "transactionHash": "0x3255cce7312e9c4470e1a1883be13718e971f6faafb96199b8bd75e5b7c39e3a",
             "transactionPosition": 19,
             "type": "call"
@@ -266,10 +249,7 @@ async fn test_trace_address_fork() {
                 "output": "0x"
             },
             "subtraces": 2,
-            "traceAddress": [
-                0,
-                1
-            ],
+            "traceAddress": [0, 1],
             "transactionHash": "0x3255cce7312e9c4470e1a1883be13718e971f6faafb96199b8bd75e5b7c39e3a",
             "transactionPosition": 19,
             "type": "call"
@@ -290,11 +270,7 @@ async fn test_trace_address_fork() {
                 "output": "0x0000000000000000000000000000000000000000000020fe99f8898600d94750"
             },
             "subtraces": 0,
-            "traceAddress": [
-                0,
-                1,
-                0
-            ],
+            "traceAddress": [0, 1, 0],
             "transactionHash": "0x3255cce7312e9c4470e1a1883be13718e971f6faafb96199b8bd75e5b7c39e3a",
             "transactionPosition": 19,
             "type": "call"
@@ -315,11 +291,7 @@ async fn test_trace_address_fork() {
                 "output": "0x"
             },
             "subtraces": 1,
-            "traceAddress": [
-                0,
-                1,
-                1
-            ],
+            "traceAddress": [0, 1, 1],
             "transactionHash": "0x3255cce7312e9c4470e1a1883be13718e971f6faafb96199b8bd75e5b7c39e3a",
             "transactionPosition": 19,
             "type": "call"
@@ -340,26 +312,20 @@ async fn test_trace_address_fork() {
                 "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
             },
             "subtraces": 0,
-            "traceAddress": [
-                0,
-                1,
-                1,
-                0
-            ],
+            "traceAddress": [0, 1, 1, 0],
             "transactionHash": "0x3255cce7312e9c4470e1a1883be13718e971f6faafb96199b8bd75e5b7c39e3a",
             "transactionPosition": 19,
             "type": "call"
         }
-    ]
-    );
+    ]);
 
-    let expected_traces: Vec<Trace> = serde_json::from_value(json).unwrap();
+    let expected_traces: Vec<LocalizedTransactionTrace> = serde_json::from_value(json).unwrap();
 
     // test matching traceAddress
     traces.into_iter().zip(expected_traces).for_each(|(a, b)| {
-        assert_eq!(a.trace_address, b.trace_address);
-        assert_eq!(a.subtraces, b.subtraces);
-        match (a.action, b.action) {
+        assert_eq!(a.trace.trace_address, b.trace.trace_address);
+        assert_eq!(a.trace.subtraces, b.trace.subtraces);
+        match (a.trace.action, b.trace.action) {
             (Action::Call(a), Action::Call(b)) => {
                 assert_eq!(a.from, b.from);
                 assert_eq!(a.to, b.to);
@@ -380,17 +346,23 @@ async fn test_trace_address_fork2() {
 
     let from: Address = "0xa009fa1ac416ec02f6f902a3a4a584b092ae6123".parse().unwrap();
     let to: Address = "0x99999999d116ffa7d76590de2f427d8e15aeb0b8".parse().unwrap();
-    let tx = TransactionRequest::new().to(to).from(from).data(input).gas(350_000);
+    let tx = TransactionRequest::default()
+        .to(to)
+        .from(from)
+        .with_input::<Bytes>(input.into())
+        .with_gas_limit(350_000);
 
+    let tx = WithOtherFields::new(tx);
     api.anvil_impersonate_account(from).await.unwrap();
 
-    let tx = provider.send_transaction(tx, None).await.unwrap().await.unwrap().unwrap();
-    assert_eq!(tx.status, Some(1u64.into()));
+    let tx = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    let status = tx.inner.inner.inner.receipt.status.coerce_status();
+    assert!(status);
 
     let traces = provider.trace_transaction(tx.transaction_hash).await.unwrap();
 
     assert!(!traces.is_empty());
-    match traces[0].action {
+    match traces[0].trace.action {
         Action::Call(ref call) => {
             assert_eq!(call.from, from);
             assert_eq!(call.to, to);
@@ -398,261 +370,226 @@ async fn test_trace_address_fork2() {
         _ => unreachable!("unexpected action"),
     }
 
-    let json = serde_json::json!(
-          [
+    let json = serde_json::json!([
+        {
+            "action": {
+                "from": "0xa009fa1ac416ec02f6f902a3a4a584b092ae6123",
+                "callType": "call",
+                "gas": "0x4fabc",
+                "input": "0x30000003000000000000000000000000adda1059a6c6c102b0fa562b9bb2cb9a0de5b1f4000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a300000004fffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb980c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000004319b52bf08b65295d49117e790000000000000000000000000000000000000000000000008b6d9e8818d6141f000000000000000000000000000000000000000000000000000000086a23af210000000000000000000000000000000000000000000000000000000000",
+                "to": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x1d51b",
+                "output": "0x"
+            },
+            "subtraces": 1,
+            "traceAddress": [],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "callType": "delegatecall",
+                "gas": "0x4d594",
+                "input": "0x00000004fffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb980c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000004319b52bf08b65295d49117e790000000000000000000000000000000000000000000000008b6d9e8818d6141f000000000000000000000000000000000000000000000000000000086a23af21",
+                "to": "0xadda1059a6c6c102b0fa562b9bb2cb9a0de5b1f4",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x1c35f",
+                "output": "0x"
+            },
+            "subtraces": 3,
+            "traceAddress": [0],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "callType": "call",
+                "gas": "0x4b6d6",
+                "input": "0x16b2da82000000000000000000000000000000000000000000000000000000086a23af21",
+                "to": "0xd1663cfb8ceaf22039ebb98914a8c98264643710",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0xd6d",
+                "output": "0x0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "subtraces": 0,
+            "traceAddress": [0, 0],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "callType": "staticcall",
+                "gas": "0x49c35",
+                "input": "0x3850c7bd",
+                "to": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0xa88",
+                "output": "0x000000000000000000000000000000000000004319b52bf08b65295d49117e7900000000000000000000000000000000000000000000000000000000000148a0000000000000000000000000000000000000000000000000000000000000010e000000000000000000000000000000000000000000000000000000000000012c000000000000000000000000000000000000000000000000000000000000012c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"
+            },
+            "subtraces": 0,
+            "traceAddress": [0, 1],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "callType": "call",
+                "gas": "0x48d01",
+                "input": "0x128acb0800000000000000000000000099999999d116ffa7d76590de2f427d8e15aeb0b80000000000000000000000000000000000000000000000000000000000000001fffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb98000000000000000000000000000000000000000000000000000000001000276a400000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000000000000000000000000000000000",
+                "to": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x18c20",
+                "output": "0x0000000000000000000000000000000000000000000000008b5116525f9edc3efffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb980"
+            },
+            "subtraces": 4,
+            "traceAddress": [0, 2],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "callType": "call",
+                "gas": "0x3802a",
+                "input": "0xa9059cbb00000000000000000000000099999999d116ffa7d76590de2f427d8e15aeb0b8000000000000000000000000000000000000000000000986236e1301eaf04680",
+                "to": "0xf4d2888d29d722226fafa5d9b24f9164c092421e",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x31b6",
+                "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
+            },
+            "subtraces": 0,
+            "traceAddress": [0, 2, 0],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "callType": "staticcall",
+                "gas": "0x34237",
+                "input": "0x70a082310000000000000000000000004b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x9e6",
+                "output": "0x000000000000000000000000000000000000000000000091cda6c1ce33e53b89"
+            },
+            "subtraces": 0,
+            "traceAddress": [0, 2, 1],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "callType": "call",
+                "gas": "0x3357e",
+                "input": "0xfa461e330000000000000000000000000000000000000000000000008b5116525f9edc3efffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb9800000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000000000000000000000000000000000",
+                "to": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x2e8b",
+                "output": "0x"
+            },
+            "subtraces": 1,
+            "traceAddress": [0, 2, 2],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
+                "callType": "call",
+                "gas": "0x324db",
+                "input": "0xa9059cbb0000000000000000000000004b5ab61593a2401b1075b90c04cbcdd3f87ce0110000000000000000000000000000000000000000000000008b5116525f9edc3e",
+                "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x2a6e",
+                "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
+            },
+            "subtraces": 0,
+            "traceAddress": [0, 2, 2, 0],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        },
+        {
+            "action": {
+                "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "callType": "staticcall",
+                "gas": "0x30535",
+                "input": "0x70a082310000000000000000000000004b5ab61593a2401b1075b90c04cbcdd3f87ce011",
+                "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "value": "0x0"
+            },
+            "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
+            "blockNumber": 15314402,
+            "result": {
+                "gasUsed": "0x216",
+                "output": "0x00000000000000000000000000000000000000000000009258f7d820938417c7"
+            },
+            "subtraces": 0,
+            "traceAddress": [0, 2, 3],
+            "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
+            "transactionPosition": 289,
+            "type": "call"
+        }
+    ]);
 
-    {
-      "action": {
-        "from": "0xa009fa1ac416ec02f6f902a3a4a584b092ae6123",
-        "callType": "call",
-        "gas": "0x4fabc",
-        "input": "0x30000003000000000000000000000000adda1059a6c6c102b0fa562b9bb2cb9a0de5b1f4000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a300000004fffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb980c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000004319b52bf08b65295d49117e790000000000000000000000000000000000000000000000008b6d9e8818d6141f000000000000000000000000000000000000000000000000000000086a23af210000000000000000000000000000000000000000000000000000000000",
-        "to": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x1d51b",
-        "output": "0x"
-      },
-      "subtraces": 1,
-      "traceAddress": [],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "callType": "delegatecall",
-        "gas": "0x4d594",
-        "input": "0x00000004fffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb980c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000004319b52bf08b65295d49117e790000000000000000000000000000000000000000000000008b6d9e8818d6141f000000000000000000000000000000000000000000000000000000086a23af21",
-        "to": "0xadda1059a6c6c102b0fa562b9bb2cb9a0de5b1f4",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x1c35f",
-        "output": "0x"
-      },
-      "subtraces": 3,
-      "traceAddress": [
-        0
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "callType": "call",
-        "gas": "0x4b6d6",
-        "input": "0x16b2da82000000000000000000000000000000000000000000000000000000086a23af21",
-        "to": "0xd1663cfb8ceaf22039ebb98914a8c98264643710",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0xd6d",
-        "output": "0x0000000000000000000000000000000000000000000000000000000000000000"
-      },
-      "subtraces": 0,
-      "traceAddress": [
-        0,
-        0
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "callType": "staticcall",
-        "gas": "0x49c35",
-        "input": "0x3850c7bd",
-        "to": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0xa88",
-        "output": "0x000000000000000000000000000000000000004319b52bf08b65295d49117e7900000000000000000000000000000000000000000000000000000000000148a0000000000000000000000000000000000000000000000000000000000000010e000000000000000000000000000000000000000000000000000000000000012c000000000000000000000000000000000000000000000000000000000000012c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"
-      },
-      "subtraces": 0,
-      "traceAddress": [
-        0,
-        1
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "callType": "call",
-        "gas": "0x48d01",
-        "input": "0x128acb0800000000000000000000000099999999d116ffa7d76590de2f427d8e15aeb0b80000000000000000000000000000000000000000000000000000000000000001fffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb98000000000000000000000000000000000000000000000000000000001000276a400000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000000000000000000000000000000000",
-        "to": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x18c20",
-        "output": "0x0000000000000000000000000000000000000000000000008b5116525f9edc3efffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb980"
-      },
-      "subtraces": 4,
-      "traceAddress": [
-        0,
-        2
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "callType": "call",
-        "gas": "0x3802a",
-        "input": "0xa9059cbb00000000000000000000000099999999d116ffa7d76590de2f427d8e15aeb0b8000000000000000000000000000000000000000000000986236e1301eaf04680",
-        "to": "0xf4d2888d29d722226fafa5d9b24f9164c092421e",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x31b6",
-        "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
-      },
-      "subtraces": 0,
-      "traceAddress": [
-        0,
-        2,
-        0
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "callType": "staticcall",
-        "gas": "0x34237",
-        "input": "0x70a082310000000000000000000000004b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x9e6",
-        "output": "0x000000000000000000000000000000000000000000000091cda6c1ce33e53b89"
-      },
-      "subtraces": 0,
-      "traceAddress": [
-        0,
-        2,
-        1
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "callType": "call",
-        "gas": "0x3357e",
-        "input": "0xfa461e330000000000000000000000000000000000000000000000008b5116525f9edc3efffffffffffffffffffffffffffffffffffffffffffff679dc91ecfe150fb9800000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2f4d2888d29d722226fafa5d9b24f9164c092421e000bb8000000000000000000000000000000000000000000",
-        "to": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x2e8b",
-        "output": "0x"
-      },
-      "subtraces": 1,
-      "traceAddress": [
-        0,
-        2,
-        2
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x99999999d116ffa7d76590de2f427d8e15aeb0b8",
-        "callType": "call",
-        "gas": "0x324db",
-        "input": "0xa9059cbb0000000000000000000000004b5ab61593a2401b1075b90c04cbcdd3f87ce0110000000000000000000000000000000000000000000000008b5116525f9edc3e",
-        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x2a6e",
-        "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
-      },
-      "subtraces": 0,
-      "traceAddress": [
-        0,
-        2,
-        2,
-        0
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    },
-    {
-      "action": {
-        "from": "0x4b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "callType": "staticcall",
-        "gas": "0x30535",
-        "input": "0x70a082310000000000000000000000004b5ab61593a2401b1075b90c04cbcdd3f87ce011",
-        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-        "value": "0x0"
-      },
-      "blockHash": "0xf689ba7749648b8c5c8f5eedd73001033f0aed7ea50b7c81048ad1533b8d3d73",
-      "blockNumber": 15314402,
-      "result": {
-        "gasUsed": "0x216",
-        "output": "0x00000000000000000000000000000000000000000000009258f7d820938417c7"
-      },
-      "subtraces": 0,
-      "traceAddress": [
-        0,
-        2,
-        3
-      ],
-      "transactionHash": "0x2d951c5c95d374263ca99ad9c20c9797fc714330a8037429a3aa4c83d456f845",
-      "transactionPosition": 289,
-      "type": "call"
-    }
-      ]
-      );
-
-    let expected_traces: Vec<Trace> = serde_json::from_value(json).unwrap();
+    let expected_traces: Vec<LocalizedTransactionTrace> = serde_json::from_value(json).unwrap();
 
     // test matching traceAddress
     traces.into_iter().zip(expected_traces).for_each(|(a, b)| {
-        assert_eq!(a.trace_address, b.trace_address);
-        assert_eq!(a.subtraces, b.subtraces);
-        match (a.action, b.action) {
+        assert_eq!(a.trace.trace_address, b.trace.trace_address);
+        assert_eq!(a.trace.subtraces, b.trace.subtraces);
+        match (a.trace.action, b.trace.action) {
             (Action::Call(a), Action::Call(b)) => {
                 assert_eq!(a.from, b.from);
                 assert_eq!(a.to, b.to);
