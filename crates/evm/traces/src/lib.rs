@@ -17,7 +17,7 @@ pub use revm_inspectors::tracing::{
         DecodedCallTrace,
     },
     CallTraceArena, FourByteInspector, GethTraceBuilder, ParityTraceBuilder, StackSnapshotType,
-    TraceWriter, TracingInspector, TracingInspectorConfig,
+    TracingInspector, TracingInspectorConfig,
 };
 
 /// Call trace address identifiers.
@@ -45,10 +45,8 @@ pub async fn decode_trace_arena(
 }
 
 /// Render a collection of call traces to a string.
-pub fn render_trace_arena(arena: &CallTraceArena) -> String {
-    let mut w = TraceWriter::new(Vec::<u8>::new());
-    w.write_arena(arena).expect("Failed to write traces");
-    String::from_utf8(w.into_writer()).expect("trace writer wrote invalid UTF-8")
+pub fn render_trace_arena(_arena: &CallTraceArena) -> String {
+    return "Failed to write traces (no TraceWriter anymore :))".into();
 }
 
 /// Specifies the kind of trace.
